@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="WorkTrack">
+<meta name="theme-color" content="#FAF8F5">
+<meta name="description" content="Work time tracker with 8h target, GPS geofencing & detailed reports">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<title>WorkTrack</title>
+<link href="https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,400;0,600;1,400;1,600&family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ══ AUTH SCREEN ══ -->
+<div id="authScreen" class="screen active">
+  <div class="auth-wrap">
+    <div class="auth-header">
+      <div class="auth-logo">
+        <div class="logo-icon">W</div>
+        <div>
+          <div class="logo-wordmark">WorkTrack</div>
+          <div class="logo-sub">Professional Time Tracking</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="auth-card">
+      <div class="auth-tabs">
+        <button class="auth-tab active" id="tabLogin" onclick="switchAuthTab('login')">Sign In</button>
+        <button class="auth-tab" id="tabRegister" onclick="switchAuthTab('register')">Register</button>
+      </div>
+
+      <div id="loginForm">
+        <div class="field-group">
+          <label class="field-lbl">Username</label>
+          <input type="text" class="field-input" id="loginUser" placeholder="your username" autocomplete="username">
+        </div>
+        <div class="field-group">
+          <label class="field-lbl">Password</label>
+          <input type="password" class="field-input" id="loginPass" placeholder="••••••••" autocomplete="current-password">
+        </div>
+        <div class="field-error" id="loginError"></div>
+        <button class="auth-submit" onclick="doLogin()">Sign In →</button>
+      </div>
+
+      <div id="registerForm" style="display:none">
+        <div class="field-group">
+          <label class="field-lbl">Full Name</label>
+          <input type="text" class="field-input" id="regName" placeholder="Your name" autocomplete="name">
+        </div>
+        <div class="field-group">
+          <label class="field-lbl">Username</label>
+          <input type="text" class="field-input" id="regUser" placeholder="choose a username" autocomplete="username">
+        </div>
+        <div class="field-group">
+          <label class="field-lbl">Password</label>
+          <input type="password" class="field-input" id="regPass" placeholder="min 6 characters" autocomplete="new-password">
+        </div>
+        <div class="field-group">
+          <label class="field-lbl">Confirm Password</label>
+          <input type="password" class="field-input" id="regPass2" placeholder="repeat password" autocomplete="new-password">
+        </div>
+        <div class="field-error" id="regError"></div>
+        <button class="auth-submit" onclick="doRegister()">Create Account →</button>
+      </div>
+    </div>
+
+    <div class="auth-note">All data stored locally on this device.</div>
+  </div>
+</div>
+
+<!-- ══ MAIN APP ══ -->
+<div id="appScreen" class="screen">
+
+  <!-- TOP BAR -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="logo-icon sm">W</div>
+      <div>
+        <div class="topbar-name" id="topName">–</div>
+        <div class="topbar-greeting" id="topGreeting">Good morning</div>
+      </div>
+    </div>
+    <button class="logout-btn" onclick="doLogout()" title="Sign out">Sign out</button>
+  </header>
+
+  <!-- NAV TABS -->
+  <nav class="nav">
+    <button class="nav-tab active" data-page="track" onclick="showPage('track')">⏱ Track</button>
+    <button class="nav-tab" data-page="report" onclick="showPage('report')">📋 Report</button>
+    <button class="nav-tab" data-page="stats" onclick="showPage('stats')">📊 Stats</button>
+    <button class="nav-tab" data-page="settings" onclick="showPage('settings')">⚙ Zone</button>
+  </nav>
+
+  <!-- ══ TRACK PAGE ══ -->
+  <div class="page active" id="pageTrack">
+    <div class="container">
+
+      <!-- GEO ALERT -->
+      <div class="geo-alert" id="geoAlert">
+        <span class="geo-alert-icon">🚨</span>
+        <div>
+          <div class="geo-alert-title">Left the work zone!</div>
+          <div class="geo-alert-desc">Timer auto-paused. Return to resume automatically.</div>
+        </div>
+      </div>
+
+      <!-- MAIN TIMER CARD -->
+      <div class="timer-card" id="timerCard">
+        <div class="timer-toprow">
+          <div class="timer-date" id="timerDate">–</div>
+          <div class="geo-pill" id="geoPill">
+            <span class="geo-pill-dot" id="geoPillDot"></span>
+            <span id="geoPillText">No zone set</span>
+          </div>
+        </div>
+
+        <div class="timer-face">
+          <div class="timer-display" id="timerDisplay">00:00:00</div>
+          <div class="timer-status" id="timerStatus">Ready to clock in</div>
+        </div>
+
+        <!-- PUNCH DETAILS — shown once clocked in -->
+        <div class="punch-details" id="punchDetails" style="display:none">
+          <div class="punch-grid">
+            <div class="punch-cell">
+              <div class="punch-lbl">Punched In</div>
+              <div class="punch-val" id="punchInTime">–</div>
+            </div>
+            <div class="punch-sep"></div>
+            <div class="punch-cell">
+              <div class="punch-lbl">Break Total</div>
+              <div class="punch-val warn" id="liveBreak">0m 00s</div>
+            </div>
+            <div class="punch-sep"></div>
+            <div class="punch-cell">
+              <div class="punch-lbl">Clock Out By</div>
+              <div class="punch-val good" id="expectedOut">–</div>
+            </div>
+          </div>
+
+          <!-- 8h PROGRESS BAR -->
+          <div class="progress-wrap">
+            <div class="progress-label">
+              <span>0h</span>
+              <span class="progress-target">8h target</span>
+              <span id="progressPct">0%</span>
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill" id="progressFill" style="width:0%"></div>
+              <div class="progress-break" id="progressBreak" style="left:0%;width:0%"></div>
+            </div>
+          </div>
+
+          <!-- REMAINING -->
+          <div class="remaining-row">
+            <div class="remaining-item">
+              <span class="remaining-lbl">Work done</span>
+              <span class="remaining-val good" id="workDone">–</span>
+            </div>
+            <div class="remaining-item">
+              <span class="remaining-lbl">Remaining</span>
+              <span class="remaining-val" id="workLeft">–</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="controls">
+          <button class="ctrl start" id="btnStart" onclick="startTimer()">▶ Clock In</button>
+          <button class="ctrl brk" id="btnPause" onclick="manualBreak()" disabled>⏸ Break</button>
+          <button class="ctrl stop" id="btnStop" onclick="stopTimer()" disabled>■ Clock Out</button>
+        </div>
+      </div>
+
+      <!-- TODAY SUMMARY -->
+      <div class="today-bar">
+        <div class="today-cell">
+          <div class="today-val" id="ts_work">–</div>
+          <div class="today-lbl">Work Today</div>
+        </div>
+        <div class="today-sep"></div>
+        <div class="today-cell">
+          <div class="today-val warn" id="ts_break">–</div>
+          <div class="today-lbl">Break Today</div>
+        </div>
+        <div class="today-sep"></div>
+        <div class="today-cell">
+          <div class="today-val" id="ts_sessions">0</div>
+          <div class="today-lbl">Sessions</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ══ REPORT PAGE ══ -->
+  <div class="page" id="pageReport">
+    <div class="container">
+      <div class="page-head">
+        <h1 class="page-title">Daily Report</h1>
+        <div class="week-nav">
+          <button class="week-btn" onclick="reportPrev()">◀</button>
+          <span class="week-lbl" id="reportPeriod">This Week</span>
+          <button class="week-btn" onclick="reportNext()">▶</button>
+        </div>
+      </div>
+      <div class="export-row">
+        <button class="exp-btn primary" onclick="exportPDF()">⬇ PDF</button>
+        <button class="exp-btn" onclick="exportCSV()">CSV</button>
+        <button class="exp-btn" onclick="exportText()">TXT</button>
+        <button class="exp-btn" onclick="reportToday()">This Week</button>
+      </div>
+      <div id="reportList"></div>
+    </div>
+  </div>
+
+  <!-- ══ STATS PAGE ══ -->
+  <div class="page" id="pageStats">
+    <div class="container">
+      <div class="page-head"><h1 class="page-title">Statistics</h1></div>
+      <div class="stats-grid">
+        <div class="stat-card highlight">
+          <div class="stat-val" id="stat_today">–</div>
+          <div class="stat-lbl">Today</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-val" id="stat_week">–</div>
+          <div class="stat-lbl">This Week</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-val" id="stat_month">–</div>
+          <div class="stat-lbl">This Month</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-val" id="stat_total">–</div>
+          <div class="stat-lbl">All Time</div>
+        </div>
+        <div class="stat-card warn">
+          <div class="stat-val" id="stat_avg_break">–</div>
+          <div class="stat-lbl">Avg Break/Day</div>
+        </div>
+        <div class="stat-card good">
+          <div class="stat-val" id="stat_sessions">0</div>
+          <div class="stat-lbl">Total Sessions</div>
+        </div>
+      </div>
+      <div class="section-lbl">Recent Sessions</div>
+      <div id="recentList"></div>
+    </div>
+  </div>
+
+  <!-- ══ SETTINGS / ZONE PAGE ══ -->
+  <div class="page" id="pageSettings">
+    <div class="container">
+      <div class="page-head"><h1 class="page-title">Work Zone</h1></div>
+
+      <div class="settings-card">
+        <div class="settings-icon">📍</div>
+        <div class="settings-title">Location Permission</div>
+        <div class="settings-desc">Grant location access to enable GPS geofencing. Timer auto-pauses when you leave the zone and resumes on return.</div>
+        <div class="perm-status" id="geoPermStatus"></div>
+        <button class="settings-btn" onclick="requestGeo()">Allow Location Access</button>
+      </div>
+
+      <div class="settings-card">
+        <div class="settings-icon">🗺</div>
+        <div class="settings-title">Set Work Zone</div>
+        <div class="settings-desc">Stand at your work location and tap Set Zone. GPS accuracy is automatically factored in.</div>
+        <div class="zone-row">
+          <div class="zone-field">
+            <label class="field-lbl">Radius (meters)</label>
+            <input type="number" class="field-input compact" id="radiusInput" value="100" min="20" max="5000">
+          </div>
+          <button class="settings-btn accent" id="btnSetZone" onclick="setWorkZone()">📌 Set Zone</button>
+        </div>
+        <div class="zone-result" id="zoneResult"></div>
+      </div>
+
+      <div class="settings-card danger">
+        <div class="settings-icon">⚠️</div>
+        <div class="settings-title">Danger Zone</div>
+        <div class="settings-desc">Permanently delete all your session data. This cannot be undone.</div>
+        <button class="settings-btn danger" onclick="clearAllData()">Delete All My Data</button>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /#appScreen -->
+
+<!-- TOAST -->
+<div class="toast" id="toast"></div>
+
+<!-- CONFIRM MODAL -->
+<div class="modal-bg" id="modalBg" onclick="closeModal()">
+  <div class="modal-box" onclick="event.stopPropagation()">
+    <div class="modal-title" id="modalTitle">Confirm</div>
+    <div class="modal-body" id="modalBody"></div>
+    <div class="modal-actions">
+      <button class="modal-btn cancel" onclick="closeModal()">Cancel</button>
+      <button class="modal-btn confirm" id="modalOk">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="db.js"></script>
+<script src="app.js"></script>
+<script>
+if('serviceWorker' in navigator){
+  window.addEventListener('load',()=>{
+    navigator.serviceWorker.register('sw.js').catch(()=>{});
+  });
+}
+</script>
+</body>
+</html>
