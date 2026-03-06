@@ -23,6 +23,22 @@ const ACCURACY_REJECT = 80;   // ignore fixes worse than this (cell-tower/WiFi n
   if (saved) { currentUser = saved; await enterApp(); }
 })();
 
+// ══ SERVICE WORKER MESSAGING ══
+// Sends a message to the active SW so it can show lock-screen notifications.
+function swPost(msg) {
+  if (!navigator.serviceWorker || !navigator.serviceWorker.controller) return;
+  navigator.serviceWorker.controller.postMessage(msg);
+}
+
+// Request notification permission once — needed for SW notifications to show.
+async function requestNotificationPermission() {
+  if (!('Notification' in window)) return;
+  if (Notification.permission === 'granted') return;
+  if (Notification.permission === 'denied') return;
+  const result = await Notification.requestPermission();
+  if (result === 'granted') showToast('🔔 Lock-screen alerts enabled');
+}
+
 // ══ AUTH ══
 function switchAuthTab(t) {
   document.getElementById('loginForm').style.display    = t === 'login'    ? 'block' : 'none';
@@ -88,6 +104,7 @@ async function enterApp() {
   await refreshStats();
   updateDateLabel();
   if (workZone) requestGeoSilent();
+  requestNotificationPermission();
   showPage('track');
 }
 
@@ -188,6 +205,7 @@ async function stopTimer() {
   const bms = calcBreakMs({ events: curEvents });
   const wms = totalMs - bms;
   showToast('✅ Clocked out — ' + fmtDur(wms) + ' work');
+  swPost({ type: 'TIMER_STOPPED' });
   await refreshStats();
 }
 
@@ -195,7 +213,12 @@ function tick() {
   const elapsed = pausedMs + (isRunning ? Date.now() - startTS : 0);
   document.getElementById('timerDisplay').textContent = msToHMS(elapsed);
   updatePunchDetails();
-  if (Math.floor(elapsed/30000) !== Math.floor((elapsed-500)/30000)) saveTimer();
+  // Heartbeat to SW every ~30s — if these stop arriving (screen locked / killed),
+  // the SW watchdog fires a lock-screen notification after 90s of silence.
+  if (Math.floor(elapsed/30000) !== Math.floor((elapsed-500)/30000)) {
+    saveTimer();
+    swPost({ type: 'HEARTBEAT' });
+  }
 }
 
 // ══ Clock-out = punch-in + 8h + total break time ══
@@ -551,7 +574,8 @@ function checkFence(pos, accuracy) {
     doPause(true);
     saveTimer();
     showToast('🚨 Left zone — paused');
-    vibrate([300, 150, 300]); // strong vibration on live zone exit
+    vibrate([300, 150, 300]);
+    swPost({ type: 'GEO_EXIT' }); // triggers lock-screen notification immediately
   }
   if (nowIn && autoGeopaused) {
     curEvents.push({ type:'geo-in', time:new Date().toISOString(), note:'Returned to zone' });
@@ -561,6 +585,7 @@ function checkFence(pos, accuracy) {
     document.getElementById('geoAlert').classList.remove('visible');
     showToast('✅ Back in zone — resumed');
     vibrate([100]);
+    swPost({ type: 'GEO_ENTER' });
   }
   if (nowIn && prev === null && !isRunning && !isPaused && !autoGeopaused)
     showToast('📍 Inside work zone — ready to clock in');
@@ -594,7 +619,10 @@ function updateGeoPill(inside, dist, effR, accuracy) {
 document.addEventListener('visibilitychange', async () => {
   if (document.visibilityState === 'visible') {
     if (workZone) pollGeoNow();
-    if (isRunning) tick();
+    if (isRunning) {
+      tick();
+      swPost({ type: 'HEARTBEAT' }); // app is visible again, reset watchdog
+    }
     if (autoGeopaused) {
       document.getElementById('geoAlert').classList.add('visible');
       showToast('🚨 Still outside work zone');
@@ -602,6 +630,10 @@ document.addEventListener('visibilitychange', async () => {
     try {
       if (wakeLock && isRunning) wakeLock = await navigator.wakeLock.request('screen');
     } catch(e) {}
+  } else {
+    // Screen locked / app backgrounded — send one last heartbeat so SW
+    // starts the 90s countdown to show "timer still running" notification
+    if (isRunning) swPost({ type: 'HEARTBEAT' });
   }
   await saveTimer();
 });
