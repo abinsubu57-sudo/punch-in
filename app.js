@@ -1,19 +1,20 @@
 'use strict';
 // ══ STATE ══
-let currentUser   = null;
-let isRunning     = false, isPaused = false, autoGeopaused = false;
-let startTS       = null,  pausedMs = 0;
-let sessionStart  = null,  curEvents = [];
-let workZone      = null;
-let watchId       = null,  insideZone = null;
-let timerInterval = null;
-let weekOffset    = 0;
-let wakeLock      = null;
-let toastTmr      = null;
-// FIX 3: Background geo polling when watchPosition fails (device sleep)
+let currentUser         = null;
+let isRunning           = false, isPaused = false, autoGeopaused = false;
+let startTS             = null,  pausedMs = 0;
+let sessionStart        = null,  curEvents = [];
+let workZone            = null;
+let watchId             = null,  insideZone = null;
+let timerInterval       = null;
+let weekOffset          = 0;
+let wakeLock            = null;
+let toastTmr            = null;
 let geoFallbackInterval = null;
-const TARGET_MS   = 8 * 3600000; // 8 hours
-const ACC_CAP     = 50;
+
+const TARGET_MS       = 8 * 3600000; // 8 hours
+const ACC_CAP         = 15;   // max bonus metres added to zone radius for GPS drift
+const ACCURACY_REJECT = 80;   // ignore fixes worse than this (cell-tower/WiFi noise)
 
 // ══ BOOT ══
 (async () => {
@@ -184,7 +185,7 @@ async function stopTimer() {
   document.getElementById('punchDetails').style.display = 'none';
   setUI('idle');
 
-  const bms = calcBreakMs({ events: [...curEvents.concat([{ type:'punch-out', time:endTime.toISOString() }])] });
+  const bms = calcBreakMs({ events: curEvents });
   const wms = totalMs - bms;
   showToast('✅ Clocked out — ' + fmtDur(wms) + ' work');
   await refreshStats();
@@ -197,20 +198,14 @@ function tick() {
   if (Math.floor(elapsed/30000) !== Math.floor((elapsed-500)/30000)) saveTimer();
 }
 
-// ══ FIX 3: Clock-out = punch-in + 8h + total accumulated break time ══
+// ══ Clock-out = punch-in + 8h + total break time ══
 function updatePunchDetails() {
   if (!sessionStart) return;
+  const elapsedMs = pausedMs + (isRunning ? Date.now() - startTS : 0);
+  const breakMs   = calcLiveBreakMs();
+  const workDone  = elapsedMs - breakMs;
+  const remaining = Math.max(0, TARGET_MS - workDone);
 
-  // Total elapsed wall-clock time since punch-in
-  const elapsedMs  = pausedMs + (isRunning ? Date.now() - startTS : 0);
-  // Break time accumulated so far (includes any ongoing break)
-  const breakMs    = calcLiveBreakMs();
-  // Pure work done = elapsed minus break time
-  const workDone   = elapsedMs - breakMs;
-  const remaining  = Math.max(0, TARGET_MS - workDone);
-
-  // FIX 3: Expected clock-out = punch-in time + 8h target + ALL break time taken so far
-  // As more breaks are taken, expectedOut shifts later by the same amount
   const expectedOut = new Date(sessionStart.getTime() + TARGET_MS + breakMs);
   document.getElementById('expectedOut').textContent =
     expectedOut.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
@@ -218,17 +213,10 @@ function updatePunchDetails() {
   document.getElementById('liveBreak').textContent = fmtDur(breakMs) || '0m 00s';
   document.getElementById('workDone').textContent  = fmtDur(workDone) || '0m 00s';
   document.getElementById('workLeft').textContent  = remaining > 0 ? fmtDur(remaining) : '✓ Done!';
+  document.getElementById('workLeft').classList.toggle('good', remaining === 0);
 
-  if (remaining === 0) {
-    document.getElementById('workLeft').classList.add('good');
-  } else {
-    document.getElementById('workLeft').classList.remove('good');
-  }
-
-  // Progress bar — work fill width as % of 8h
   const workPct  = Math.min(100, (workDone / TARGET_MS) * 100);
   const breakPct = Math.min(100 - workPct, (breakMs / TARGET_MS) * 100);
-
   document.getElementById('progressFill').style.width  = workPct  + '%';
   document.getElementById('progressBreak').style.left  = workPct  + '%';
   document.getElementById('progressBreak').style.width = breakPct + '%';
@@ -243,7 +231,6 @@ function calcLiveBreakMs() {
       ms += new Date(ev.time) - lastOut; lastOut = null;
     }
   });
-  // If currently on break (manual or geo), count ongoing break time too
   if ((isPaused || autoGeopaused) && lastOut) ms += Date.now() - lastOut;
   return ms;
 }
@@ -300,38 +287,49 @@ async function saveTimer() {
   });
 }
 
+// ══ SMART WAKE-UP RESTORE ══
+// When the device powers back on / app resumes after a gap, we do NOT blindly
+// insert a break for that gap. Instead we immediately request the current GPS
+// position and decide based on actual location:
+//   • Still inside zone  → gap was just device sleep, add as work time (no break)
+//   • Outside zone       → genuine absence, record as geo break + vibrate + alert
+//   • GPS unavailable    → safe fallback: record as break, warn user
 async function restoreTimer() {
   const s = await DB.get('timer', currentUser.username);
   if (!s) return;
+
   pausedMs     = s.pausedMs     || 0;
   sessionStart = s.sessionStart ? new Date(s.sessionStart) : null;
   curEvents    = s.curEvents    || [];
 
   if (s.isRunning && s.startTS) {
-    // FIX 2: When restoring after device sleep, account for the time gap.
-    // The gap since savedAt is added as a geo-out/geo-in event pair so break
-    // time is correctly tracked and the user is warned if they were offline.
-    const gapMs = Date.now() - s.savedAt;
-    if (gapMs > 15000) {
-      // Device was likely sleeping — treat gap as auto-paused geo break
-      curEvents.push({ type:'geo-out', time: new Date(s.savedAt).toISOString(), note:'Device sleep / offline' });
-      curEvents.push({ type:'geo-in',  time: new Date().toISOString(),           note:'App resumed' });
-      pausedMs += gapMs;
+    const gapMs    = Date.now() - s.savedAt;
+    const gapStart = new Date(s.savedAt).toISOString();
+    const gapEnd   = new Date().toISOString();
+
+    if (gapMs > 8000 && workZone) {
+      // Show a "checking location…" state while we resolve
+      document.getElementById('timerStatus').textContent = '📡 Checking location after sleep…';
+      document.getElementById('punchDetails').style.display = 'block';
+      if (sessionStart) document.getElementById('punchInTime').textContent =
+        sessionStart.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
+
+      // Ask for GPS position with a reasonable timeout
+      resolveWakeUpGap(gapMs, gapStart, gapEnd, s);
+
     } else {
+      // Short gap (< 8s) — just resume normally, no break needed
       pausedMs += gapMs;
-    }
-    startTS = Date.now(); isRunning = true;
-    timerInterval = setInterval(tick, 500);
-    setUI('running');
-    document.getElementById('punchDetails').style.display = 'block';
-    if (sessionStart) document.getElementById('punchInTime').textContent =
-      sessionStart.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
-    tick();
-    if (gapMs > 15000) {
-      showToast('⚠ Device was asleep — break recorded for gap');
-    } else {
+      startTS = Date.now(); isRunning = true;
+      timerInterval = setInterval(tick, 500);
+      setUI('running');
+      document.getElementById('punchDetails').style.display = 'block';
+      if (sessionStart) document.getElementById('punchInTime').textContent =
+        sessionStart.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
+      tick();
       showToast('🔄 Timer restored');
     }
+
   } else if (s.isPaused) {
     isPaused = true;
     document.getElementById('timerDisplay').textContent = msToHMS(pausedMs);
@@ -339,6 +337,7 @@ async function restoreTimer() {
     if (sessionStart) document.getElementById('punchInTime').textContent =
       sessionStart.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
     setUI('paused'); updatePunchDetails();
+
   } else if (s.autoGeopaused) {
     autoGeopaused = true;
     document.getElementById('timerDisplay').textContent = msToHMS(pausedMs);
@@ -349,13 +348,101 @@ async function restoreTimer() {
   }
 }
 
+function resolveWakeUpGap(gapMs, gapStart, gapEnd, savedState) {
+  const gapMins = Math.round(gapMs / 60000);
+
+  navigator.geolocation.getCurrentPosition(
+    pos => {
+      // Got a GPS fix — check if we're still inside the zone
+      const accuracy = pos.coords.accuracy;
+      const dist     = haversine(pos.coords.latitude, pos.coords.longitude, workZone.lat, workZone.lng);
+      const bonus    = accuracy ? Math.min(Math.ceil(accuracy), ACC_CAP) : 0;
+      const effR     = workZone.radius + bonus;
+      const nowInside = dist <= effR && accuracy <= ACCURACY_REJECT;
+
+      if (nowInside) {
+        // ✅ Phone never left — gap is pure device sleep, count as WORK TIME
+        // Simply add the gap to elapsed work (pausedMs already has pre-gap work)
+        pausedMs += gapMs;
+        insideZone = true;
+        updateGeoPill(true, dist, effR, accuracy);
+        startTS = Date.now(); isRunning = true;
+        timerInterval = setInterval(tick, 500);
+        setUI('running');
+        tick();
+        showToast('🔄 Restored — device slept ' + gapMins + 'm, still in zone ✓');
+
+      } else {
+        // 🚨 Phone moved outside or GPS confirms absence — record as break
+        curEvents.push({ type:'geo-out', time: gapStart, note: 'Device off / sleep' });
+        curEvents.push({ type:'geo-in',  time: gapEnd,   note: 'App resumed' });
+        pausedMs += gapMs;
+        insideZone = false;
+        updateGeoPill(false, dist, effR, accuracy);
+
+        // Resume running but mark as just-returned-from-geo-break
+        startTS = Date.now(); isRunning = true; autoGeopaused = false;
+        timerInterval = setInterval(tick, 500);
+        setUI('running');
+        tick();
+
+        // Vibrate hard to alert user that a break was recorded
+        vibrate([300, 150, 300, 150, 500]);
+        showToast('🚨 Was outside zone for ' + gapMins + 'm — break recorded');
+        // Show the geo alert banner briefly so it's impossible to miss
+        const alertEl = document.getElementById('geoAlert');
+        alertEl.querySelector('.geo-alert-title').textContent = 'Break recorded for device sleep!';
+        alertEl.querySelector('.geo-alert-desc').textContent =
+          'Phone was outside the zone for ~' + gapMins + ' min while off. Break added to report.';
+        alertEl.classList.add('visible');
+        setTimeout(() => alertEl.classList.remove('visible'), 8000);
+      }
+
+      saveTimer();
+      updatePunchDetails();
+    },
+
+    () => {
+      // GPS unavailable on resume (no signal, denied, etc.)
+      // Safe fallback: record the gap as a break so no false work time is added
+      curEvents.push({ type:'geo-out', time: gapStart, note: 'Device off — GPS unavailable on resume' });
+      curEvents.push({ type:'geo-in',  time: gapEnd,   note: 'App resumed' });
+      pausedMs += gapMs;
+
+      startTS = Date.now(); isRunning = true;
+      timerInterval = setInterval(tick, 500);
+      setUI('running');
+      document.getElementById('punchDetails').style.display = 'block';
+      if (sessionStart) document.getElementById('punchInTime').textContent =
+        sessionStart.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
+      tick();
+
+      vibrate([200, 100, 200]);
+      showToast('⚠ GPS unavailable — ' + gapMins + 'm gap recorded as break');
+      saveTimer();
+      updatePunchDetails();
+    },
+
+    // Use a slightly stale cached position if available (faster response on wake-up)
+    // but not older than 30s — beyond that the phone may have moved significantly
+    { enableHighAccuracy: true, timeout: 12000, maximumAge: 30000 }
+  );
+}
+
 // ══ GEOFENCING ══
 async function requestGeo() {
   if (!navigator.geolocation) { showToast('❌ Geolocation not supported'); return; }
   document.getElementById('geoPermStatus').textContent = 'Requesting…';
   navigator.geolocation.getCurrentPosition(
-    () => { document.getElementById('geoPermStatus').textContent = '✅ Permission granted'; showToast('📍 Location access granted'); if (workZone) startWatch(); },
-    err => { document.getElementById('geoPermStatus').textContent = err.code === 1 ? '❌ Denied — enable in settings' : '❌ GPS unavailable'; },
+    () => {
+      document.getElementById('geoPermStatus').textContent = '✅ Permission granted';
+      showToast('📍 Location access granted');
+      if (workZone) startWatch();
+    },
+    err => {
+      document.getElementById('geoPermStatus').textContent =
+        err.code === 1 ? '❌ Denied — enable in settings' : '❌ GPS unavailable';
+    },
     { enableHighAccuracy:true, timeout:15000, maximumAge:0 }
   );
 }
@@ -367,14 +454,13 @@ function requestGeoSilent() {
   }).catch(() => startWatch());
 }
 
-// FIX 1: Changed minimum radius from 20m to 5m
 async function setWorkZone() {
   if (!navigator.geolocation) { showToast('❌ Not supported'); return; }
   const btn = document.getElementById('btnSetZone');
   btn.disabled = true; btn.textContent = '📡 Getting GPS…';
   navigator.geolocation.getCurrentPosition(
     async pos => {
-      const r = Math.max(5, parseInt(document.getElementById('radiusInput').value) || 100); // FIX 1: was Math.max(20, ...)
+      const r = Math.max(5, parseInt(document.getElementById('radiusInput').value) || 100);
       workZone = { username: currentUser.username, lat: pos.coords.latitude, lng: pos.coords.longitude, radius: r };
       await DB.put('zones', workZone);
       btn.disabled = false; btn.textContent = '📌 Update Zone';
@@ -392,33 +478,28 @@ async function setWorkZone() {
 
 function updateZoneDisplay(accuracy) {
   if (!workZone) return;
-  const acc = accuracy ? Math.round(accuracy) : null;
+  const acc  = accuracy ? Math.round(accuracy) : null;
   const warn = acc && acc > workZone.radius * 0.5;
-  const el = document.getElementById('zoneResult');
+  const el   = document.getElementById('zoneResult');
   el.style.display = 'block';
   el.className = 'zone-result' + (warn ? ' warn' : '');
-  el.innerHTML = `✓ <strong>${workZone.lat.toFixed(5)}, ${workZone.lng.toFixed(5)}</strong> · Radius: ${workZone.radius}m` +
-    (acc ? `<br>${warn ? '⚠ GPS ±' + acc + 'm — effective radius expanded' : '✓ GPS accuracy ±' + acc + 'm'}` : '');
+  el.innerHTML =
+    `✓ <strong>${workZone.lat.toFixed(5)}, ${workZone.lng.toFixed(5)}</strong> · Radius: ${workZone.radius}m` +
+    (acc ? `<br>${warn ? '⚠ GPS ±' + acc + 'm — consider increasing radius' : '✓ GPS accuracy ±' + acc + 'm'}` : '');
   document.getElementById('radiusInput').value = workZone.radius;
 }
 
-// FIX 2: startWatch now also launches a fallback polling interval every 30s
-// so the fence is checked even when watchPosition stops firing (device sleep/background)
+// ══ GPS WATCH ══
 function startWatch() {
   if (watchId !== null) navigator.geolocation.clearWatch(watchId);
   if (!navigator.geolocation) return;
 
   watchId = navigator.geolocation.watchPosition(
     pos => { if (workZone) checkFence({ lat: pos.coords.latitude, lng: pos.coords.longitude }, pos.coords.accuracy); },
-    err  => {
-      // FIX 2: On watch error (e.g. GPS lost) trigger an immediate poll so state updates
-      pollGeoNow();
-    },
-    { enableHighAccuracy:true, maximumAge:5000, timeout:20000 }
+    ()   => { pollGeoNow(); },
+    { enableHighAccuracy:true, maximumAge:2000, timeout:20000 }
   );
 
-  // FIX 2: Fallback poll every 30s — fires getCurrentPosition independently so
-  // alerts still fire even if watchPosition is frozen (common on Android/iOS when screen is off)
   if (geoFallbackInterval) clearInterval(geoFallbackInterval);
   geoFallbackInterval = setInterval(pollGeoNow, 30000);
 }
@@ -427,18 +508,17 @@ function pollGeoNow() {
   if (!workZone || !navigator.geolocation) return;
   navigator.geolocation.getCurrentPosition(
     pos => checkFence({ lat: pos.coords.latitude, lng: pos.coords.longitude }, pos.coords.accuracy),
-    ()  => {
-      // GPS unavailable — if timer is running, treat as geo-out (lost signal = left zone)
+    () => {
       if (isRunning && insideZone !== false) {
         insideZone = false;
-        updateGeoPill(false, Infinity, workZone ? workZone.radius : 0);
+        updateGeoPill(false, Infinity, workZone.radius, null);
         doPause(true);
         saveTimer();
         showToast('🚨 GPS lost — paused');
         vibrate([200, 100, 200]);
       }
     },
-    { enableHighAccuracy:true, timeout:10000, maximumAge:10000 }
+    { enableHighAccuracy:true, timeout:10000, maximumAge:2000 }
   );
 }
 
@@ -447,43 +527,74 @@ function stopWatch() {
   if (geoFallbackInterval) { clearInterval(geoFallbackInterval); geoFallbackInterval = null; }
 }
 
+// ══ FENCE CHECK — with accuracy filtering ══
 function checkFence(pos, accuracy) {
   if (!workZone) return;
-  const dist   = haversine(pos.lat, pos.lng, workZone.lat, workZone.lng);
-  const bonus  = accuracy ? Math.min(Math.ceil(accuracy), ACC_CAP) : 0;
-  const effR   = workZone.radius + bonus;
-  const nowIn  = dist <= effR;
-  updateGeoPill(nowIn, dist, effR);
+
+  // Reject very poor fixes (cell-tower/WiFi coarse location)
+  if (accuracy && accuracy > ACCURACY_REJECT) {
+    updateGeoPill(insideZone === true, null, workZone.radius, accuracy);
+    return;
+  }
+
+  const dist  = haversine(pos.lat, pos.lng, workZone.lat, workZone.lng);
+  const bonus = accuracy ? Math.min(Math.ceil(accuracy), ACC_CAP) : 0;
+  const effR  = workZone.radius + bonus;
+  const nowIn = dist <= effR;
+
+  updateGeoPill(nowIn, dist, effR, accuracy);
   if (nowIn === insideZone) return;
+
   const prev = insideZone; insideZone = nowIn;
-  if (!nowIn && isRunning) { doPause(true); saveTimer(); showToast('🚨 Left zone — paused'); vibrate([200,100,200]); }
+
+  if (!nowIn && isRunning) {
+    doPause(true);
+    saveTimer();
+    showToast('🚨 Left zone — paused');
+    vibrate([300, 150, 300]); // strong vibration on live zone exit
+  }
   if (nowIn && autoGeopaused) {
     curEvents.push({ type:'geo-in', time:new Date().toISOString(), note:'Returned to zone' });
     startTS = Date.now(); isRunning = true; autoGeopaused = false;
     timerInterval = setInterval(tick, 500);
     setUI('running'); saveTimer(); updatePunchDetails();
     document.getElementById('geoAlert').classList.remove('visible');
-    showToast('✅ Back in zone — resumed'); vibrate([100]);
+    showToast('✅ Back in zone — resumed');
+    vibrate([100]);
   }
   if (nowIn && prev === null && !isRunning && !isPaused && !autoGeopaused)
     showToast('📍 Inside work zone — ready to clock in');
 }
 
-function updateGeoPill(inside, dist, effR) {
-  const pill = document.getElementById('geoPill');
-  const dStr = dist === Infinity ? 'GPS lost' : dist < 1000 ? Math.round(dist) + 'm' : (dist/1000).toFixed(2) + 'km';
+// ══ GEO PILL — shows distance + live GPS accuracy ══
+function updateGeoPill(inside, dist, effR, accuracy) {
+  const pill   = document.getElementById('geoPill');
+  const accStr = accuracy ? ' ±' + Math.round(accuracy) + 'm' : '';
+
+  let text;
+  if (dist === null) {
+    text = (inside ? '✓ In zone' : '✗ Out') + ' · weak GPS' + accStr;
+  } else if (dist === Infinity) {
+    text = '✗ GPS lost';
+  } else {
+    const dStr = dist < 1000 ? Math.round(dist) + 'm' : (dist / 1000).toFixed(2) + 'km';
+    text = inside
+      ? '✓ In zone · ' + dStr + accStr
+      : '✗ ' + dStr + ' away' + accStr;
+  }
+
   pill.className = 'geo-pill ' + (inside ? 'inside' : 'outside');
   document.getElementById('geoPillDot').style.background = inside ? 'var(--green)' : 'var(--red)';
-  document.getElementById('geoPillText').textContent = inside ? '✓ In zone · ' + dStr : '✗ ' + dStr + ' away';
+  document.getElementById('geoPillText').textContent = text;
 }
 
-// FIX 2: When app becomes visible again, immediately re-check fence and restore wake lock
+// ══ VISIBILITY CHANGE ══
+// When the app comes back to foreground (screen unlock, tab switch, etc.)
+// immediately poll GPS and re-evaluate zone state — never assume.
 document.addEventListener('visibilitychange', async () => {
   if (document.visibilityState === 'visible') {
-    // Re-check fence position immediately on app resume
     if (workZone) pollGeoNow();
     if (isRunning) tick();
-    // FIX 2: Show alert banner again if still in outside state after resume
     if (autoGeopaused) {
       document.getElementById('geoAlert').classList.add('visible');
       showToast('🚨 Still outside work zone');
@@ -516,19 +627,16 @@ async function refreshStats() {
     if (d >= monthStart) monthW += wms;
   });
 
-  // Track page
-  document.getElementById('ts_work').textContent     = fmtDur(todayW) || '—';
-  document.getElementById('ts_break').textContent    = fmtDur(todayB) || '—';
-  document.getElementById('ts_sessions').textContent = todayN;
-
-  // Stats page
+  document.getElementById('ts_work').textContent       = fmtDur(todayW) || '—';
+  document.getElementById('ts_break').textContent      = fmtDur(todayB) || '—';
+  document.getElementById('ts_sessions').textContent   = todayN;
   document.getElementById('stat_today').textContent    = fmtDur(todayW) || '—';
   document.getElementById('stat_week').textContent     = fmtDur(weekW)  || '—';
   document.getElementById('stat_month').textContent    = fmtDur(monthW) || '—';
   document.getElementById('stat_total').textContent    = fmtDur(totalW) || '—';
   document.getElementById('stat_sessions').textContent = sessions.length;
 
-  const days    = new Set(sessions.map(s => new Date(s.start).toDateString())).size;
+  const days     = new Set(sessions.map(s => new Date(s.start).toDateString())).size;
   const avgBreak = days > 0 ? Math.round(totalB / days) : 0;
   document.getElementById('stat_avg_break').textContent = fmtDur(avgBreak) || '—';
 }
@@ -576,7 +684,8 @@ async function renderReport() {
   const { start, end } = weekRange(weekOffset);
   document.getElementById('reportPeriod').textContent =
     weekOffset===0 ? 'This Week' : weekOffset===-1 ? 'Last Week' :
-    start.toLocaleDateString([],{month:'short',day:'numeric'}) + ' – ' + end.toLocaleDateString([],{month:'short',day:'numeric',year:'numeric'});
+    start.toLocaleDateString([],{month:'short',day:'numeric'}) + ' – ' +
+    end.toLocaleDateString([],{month:'short',day:'numeric',year:'numeric'});
 
   const all     = await DB.getUserSessions(currentUser.username);
   const inRange = all.filter(s => { const d = new Date(s.start); return d >= start && d <= end; });
@@ -591,10 +700,10 @@ async function renderReport() {
   const days  = Object.entries(byDay).sort((a,b) => new Date(b[0]) - new Date(a[0]));
 
   el.innerHTML = days.map(([ds, daySessions], idx) => {
-    const dd     = new Date(ds);
-    const totMs  = daySessions.reduce((a,s)=>a+s.duration, 0);
-    const brkMs  = daySessions.reduce((a,s)=>a+calcBreakMs(s), 0);
-    const wrkMs  = totMs - brkMs;
+    const dd    = new Date(ds);
+    const totMs = daySessions.reduce((a,s)=>a+s.duration, 0);
+    const brkMs = daySessions.reduce((a,s)=>a+calcBreakMs(s), 0);
+    const wrkMs = totMs - brkMs;
     return `<div class="day-card${idx===0?' open':''}">
       <div class="day-head" onclick="this.parentElement.classList.toggle('open')">
         <div>
@@ -639,8 +748,16 @@ function buildSessionBlock(s, num, total) {
 
 function buildTimeline(events) {
   let html = '', lastBrkOut = null;
-  const labels = { 'punch-in':'Punch In', 'punch-out':'Punch Out', 'break-out':'Break Out', 'break-in':'Break In', 'geo-out':'Left Zone (auto)', 'geo-in':'Returned (auto)' };
-  const dots   = { 'punch-in':'punch-in', 'punch-out':'punch-out', 'break-out':'break-out', 'break-in':'break-in', 'geo-out':'geo-out', 'geo-in':'geo-in' };
+  const labels = {
+    'punch-in':'Punch In','punch-out':'Punch Out',
+    'break-out':'Break Out','break-in':'Break In',
+    'geo-out':'Left Zone (auto)','geo-in':'Returned (auto)'
+  };
+  const dots = {
+    'punch-in':'punch-in','punch-out':'punch-out',
+    'break-out':'break-out','break-in':'break-in',
+    'geo-out':'geo-out','geo-in':'geo-in'
+  };
   events.forEach((ev, i) => {
     const t  = new Date(ev.time);
     const ts = t.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit', second:'2-digit' });
@@ -652,7 +769,14 @@ function buildTimeline(events) {
     } else if ((ev.type === 'break-in' || ev.type === 'geo-in') && lastBrkOut) {
       dur = `<div class="tl-dur brk">Break: ${fmtDur(t - lastBrkOut)}</div>`; lastBrkOut = null;
     }
-    html += `<div class="tl-event"><div class="tl-dot ${dots[ev.type]||''}"></div><div><div class="tl-time">${ts}</div><div class="tl-label">${labels[ev.type]||ev.type}${ev.note?' · '+ev.note:''}</div>${dur}</div></div>`;
+    html += `<div class="tl-event">
+      <div class="tl-dot ${dots[ev.type]||''}"></div>
+      <div>
+        <div class="tl-time">${ts}</div>
+        <div class="tl-label">${labels[ev.type]||ev.type}${ev.note?' · '+ev.note:''}</div>
+        ${dur}
+      </div>
+    </div>`;
   });
   return html;
 }
@@ -722,45 +846,56 @@ async function exportPDF() {
   const st=(c)=>doc.setTextColor(c[0],c[1],c[2]);
 
   fr(0,0,PW,PH,bg);
-
-  // Header
-  fr(0,0,PW,30,surf); fr(0,0,4,30,acc);
-  fr(0,30,PW,0.4,brd);
+  fr(0,0,PW,30,surf); fr(0,0,4,30,acc); fr(0,30,PW,0.4,brd);
   doc.setFont('helvetica','bold'); doc.setFontSize(16); st(ink); doc.text('WorkTrack',8,18);
   doc.setFont('helvetica','normal'); doc.setFontSize(7.5); st(ink3); doc.text('Daily Work Report',8,24.5);
   doc.setFontSize(7); st(ink3);
   doc.text('Generated '+new Date().toLocaleString([],{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'}),PW-MR,10,{align:'right'});
-  const per=weekOffset===0?'This Week':weekOffset===-1?'Last Week':start.toLocaleDateString([],{month:'short',day:'numeric'})+' – '+end.toLocaleDateString([],{month:'short',day:'numeric',year:'numeric'});
+  const per=weekOffset===0?'This Week':weekOffset===-1?'Last Week':
+    start.toLocaleDateString([],{month:'short',day:'numeric'})+' – '+
+    end.toLocaleDateString([],{month:'short',day:'numeric',year:'numeric'});
   doc.setFontSize(8.5); doc.setFont('helvetica','bold'); st(ink2); doc.text(per,PW-MR,19,{align:'right'});
   doc.setFontSize(7); doc.setFont('helvetica','normal'); st(ink3);
   doc.text('User: '+currentUser.name+' (@'+currentUser.username+')',PW-MR,26,{align:'right'});
   y=36;
 
-  // Week summary
   const wW=inRange.reduce((a,s)=>a+s.duration-calcBreakMs(s),0);
   const wB=inRange.reduce((a,s)=>a+calcBreakMs(s),0);
   const wD=new Set(inRange.map(s=>new Date(s.start).toDateString())).size;
   doc.setFillColor(surf2[0],surf2[1],surf2[2]); doc.rect(ML,y,CW,18,'F');
   doc.setDrawColor(brd[0],brd[1],brd[2]); doc.setLineWidth(0.3); doc.rect(ML,y,CW,18,'S');
-  [{lbl:'Total Work',val:fmtDur(wW)||'—',col:grn},{lbl:'Total Breaks',val:fmtDur(wB)||'None',col:amb},{lbl:'Days Worked',val:wD+' day'+(wD!==1?'s':''),col:blu}].forEach((item,i)=>{
+  [{lbl:'Total Work',val:fmtDur(wW)||'—',col:grn},
+   {lbl:'Total Breaks',val:fmtDur(wB)||'None',col:amb},
+   {lbl:'Days Worked',val:wD+' day'+(wD!==1?'s':''),col:blu}
+  ].forEach((item,i)=>{
     const cx=ML+CW/3*i+CW/6;
-    doc.setFont('helvetica','bold'); doc.setFontSize(10.5); doc.setTextColor(item.col[0],item.col[1],item.col[2]); doc.text(item.val,cx,y+10.5,{align:'center'});
-    doc.setFont('helvetica','normal'); doc.setFontSize(6); st(ink3); doc.text(item.lbl.toUpperCase(),cx,y+16,{align:'center'});
+    doc.setFont('helvetica','bold'); doc.setFontSize(10.5);
+    doc.setTextColor(item.col[0],item.col[1],item.col[2]); doc.text(item.val,cx,y+10.5,{align:'center'});
+    doc.setFont('helvetica','normal'); doc.setFontSize(6); st(ink3);
+    doc.text(item.lbl.toUpperCase(),cx,y+16,{align:'center'});
     if(i>0){doc.setDrawColor(brd[0],brd[1],brd[2]);doc.setLineWidth(0.3);doc.line(ML+CW/3*i,y+2,ML+CW/3*i,y+16);}
   });
   y+=24;
 
   const byDay={};
   inRange.forEach(s=>{const k=new Date(s.start).toDateString();if(!byDay[k])byDay[k]=[];byDay[k].push(s);});
-  const evConf={'punch-in':{col:grn,lbl:'Punch In'},'punch-out':{col:acc,lbl:'Punch Out'},'break-out':{col:amb,lbl:'Break Out'},'break-in':{col:blu,lbl:'Break In'},'geo-out':{col:red,lbl:'Left Zone'},'geo-in':{col:grn,lbl:'Returned to Zone'}};
+  const evConf={
+    'punch-in':{col:grn,lbl:'Punch In'},'punch-out':{col:acc,lbl:'Punch Out'},
+    'break-out':{col:amb,lbl:'Break Out'},'break-in':{col:blu,lbl:'Break In'},
+    'geo-out':{col:red,lbl:'Left Zone'},'geo-in':{col:grn,lbl:'Returned to Zone'}
+  };
   function chkPg(n){if(y+n>PH-14){doc.addPage();fr(0,0,PW,PH,bg);y=16;}}
 
   Object.entries(byDay).forEach(([ds,daySessions])=>{
-    const dd=new Date(ds),totMs=daySessions.reduce((a,s)=>a+s.duration,0),brkMs=daySessions.reduce((a,s)=>a+calcBreakMs(s),0),wrkMs=totMs-brkMs;
+    const dd=new Date(ds);
+    const totMs=daySessions.reduce((a,s)=>a+s.duration,0);
+    const brkMs=daySessions.reduce((a,s)=>a+calcBreakMs(s),0);
+    const wrkMs=totMs-brkMs;
     chkPg(36);
     doc.setFillColor(surf2[0],surf2[1],surf2[2]); doc.rect(ML,y,CW,12,'F');
     doc.setFillColor(acc[0],acc[1],acc[2]); doc.rect(ML,y,4,12,'F');
-    doc.setFont('helvetica','bold'); doc.setFontSize(9.5); st(ink); doc.text(dd.toLocaleDateString([],{weekday:'long',day:'2-digit',month:'long',year:'numeric'}),ML+7,y+8.5);
+    doc.setFont('helvetica','bold'); doc.setFontSize(9.5); st(ink);
+    doc.text(dd.toLocaleDateString([],{weekday:'long',day:'2-digit',month:'long',year:'numeric'}),ML+7,y+8.5);
     doc.setTextColor(grn[0],grn[1],grn[2]); doc.text(fmtDur(wrkMs),PW-MR,y+8.5,{align:'right'});
     y+=14;
 
@@ -770,8 +905,10 @@ async function exportPDF() {
       chkPg(12+evs.length*8+10);
       doc.setFillColor(surf[0],surf[1],surf[2]); doc.rect(ML+2,y,CW-4,8,'F');
       doc.setDrawColor(brd[0],brd[1],brd[2]); doc.setLineWidth(0.25); doc.rect(ML+2,y,CW-4,8,'S');
-      doc.setFont('helvetica','normal'); doc.setFontSize(6.5); st(ink3); doc.text('SESSION '+(si+1)+(daySessions.length>1?' / '+daySessions.length:''),ML+6,y+5.5);
-      doc.setFont('helvetica','bold'); doc.setFontSize(7.5); doc.setTextColor(grn[0],grn[1],grn[2]); doc.text(fmtDur(wms)+' work',PW-MR-2,y+5.5,{align:'right'});
+      doc.setFont('helvetica','normal'); doc.setFontSize(6.5); st(ink3);
+      doc.text('SESSION '+(si+1)+(daySessions.length>1?' / '+daySessions.length:''),ML+6,y+5.5);
+      doc.setFont('helvetica','bold'); doc.setFontSize(7.5);
+      doc.setTextColor(grn[0],grn[1],grn[2]); doc.text(fmtDur(wms)+' work',PW-MR-2,y+5.5,{align:'right'});
       y+=10;
       let lastBrk=null;
       evs.forEach((ev,ei)=>{
@@ -780,24 +917,36 @@ async function exportPDF() {
         chkPg(8);
         doc.setFillColor(conf.col[0],conf.col[1],conf.col[2]); doc.circle(ML+8,y+2.5,1.5,'F');
         doc.setFont('helvetica','bold'); doc.setFontSize(7.5); st(ink); doc.text(ts,ML+13,y+4);
-        doc.setFont('helvetica','normal'); doc.setFontSize(6.5); st(ink2); doc.text(conf.lbl+(ev.note?' · '+ev.note:''),ML+34,y+4);
+        doc.setFont('helvetica','normal'); doc.setFontSize(6.5); st(ink2);
+        doc.text(conf.lbl+(ev.note?' · '+ev.note:''),ML+34,y+4);
         if(ev.type==='break-out'||ev.type==='geo-out') lastBrk=t;
-        else if((ev.type==='break-in'||ev.type==='geo-in')&&lastBrk){doc.setFont('helvetica','italic');doc.setFontSize(6.5);doc.setTextColor(amb[0],amb[1],amb[2]);doc.text('Break: '+fmtDur(t-lastBrk),PW-MR-2,y+4,{align:'right'});lastBrk=null;}
-        else if(ev.type==='punch-out'){const pi=findPrevIn(evs,ei);if(pi){doc.setFont('helvetica','italic');doc.setFontSize(6.5);doc.setTextColor(grn[0],grn[1],grn[2]);doc.text('+'+fmtDur(t-new Date(pi.time)),PW-MR-2,y+4,{align:'right'});}}
+        else if((ev.type==='break-in'||ev.type==='geo-in')&&lastBrk){
+          doc.setFont('helvetica','italic');doc.setFontSize(6.5);
+          doc.setTextColor(amb[0],amb[1],amb[2]);
+          doc.text('Break: '+fmtDur(t-lastBrk),PW-MR-2,y+4,{align:'right'});lastBrk=null;
+        } else if(ev.type==='punch-out'){
+          const pi=findPrevIn(evs,ei);
+          if(pi){doc.setFont('helvetica','italic');doc.setFontSize(6.5);
+            doc.setTextColor(grn[0],grn[1],grn[2]);
+            doc.text('+'+fmtDur(t-new Date(pi.time)),PW-MR-2,y+4,{align:'right'});}
+        }
         y+=8;
       });
       doc.setFillColor(surf2[0],surf2[1],surf2[2]); doc.rect(ML+2,y,CW-4,7,'F');
       [{lbl:'Work',val:fmtDur(wms),col:grn},{lbl:'Break',val:fmtDur(bms)||'—',col:amb},{lbl:'Total',val:fmtDur(s.duration),col:ink2}].forEach((c,ci)=>{
         const cx2=ML+2+(CW-4)/3*ci+(CW-4)/6;
-        doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(c.col[0],c.col[1],c.col[2]); doc.text(c.val,cx2,y+5,{align:'center'});
+        doc.setFont('helvetica','bold'); doc.setFontSize(7);
+        doc.setTextColor(c.col[0],c.col[1],c.col[2]); doc.text(c.val,cx2,y+5,{align:'center'});
       });
       y+=10;
     });
+
     chkPg(12);
     doc.setFillColor(surf2[0],surf2[1],surf2[2]); doc.rect(ML,y,CW,9,'F');
     doc.setFont('helvetica','bold'); doc.setFontSize(6.5); st(ink3); doc.text('DAY TOTAL',ML+4,y+6.5);
     doc.setTextColor(grn[0],grn[1],grn[2]); doc.text(fmtDur(wrkMs)+' work',ML+28,y+6.5);
-    doc.setFont('helvetica','normal'); doc.setFontSize(6.5); doc.setTextColor(amb[0],amb[1],amb[2]); doc.text('  ·  '+(fmtDur(brkMs)||'no breaks'),ML+60,y+6.5);
+    doc.setFont('helvetica','normal'); doc.setFontSize(6.5);
+    doc.setTextColor(amb[0],amb[1],amb[2]); doc.text('  ·  '+(fmtDur(brkMs)||'no breaks'),ML+60,y+6.5);
     y+=14;
   });
 
@@ -850,7 +999,9 @@ async function exportText() {
   const byDay={};
   inRange.forEach(s=>{const k=new Date(s.start).toDateString();if(!byDay[k])byDay[k]=[];byDay[k].push(s);});
   Object.entries(byDay).forEach(([ds,daySessions])=>{
-    const dd=new Date(ds),totMs=daySessions.reduce((a,s)=>a+s.duration,0),brkMs=daySessions.reduce((a,s)=>a+calcBreakMs(s),0);
+    const dd=new Date(ds);
+    const totMs=daySessions.reduce((a,s)=>a+s.duration,0);
+    const brkMs=daySessions.reduce((a,s)=>a+calcBreakMs(s),0);
     txt+=`${dd.toLocaleDateString([],{weekday:'long',day:'2-digit',month:'long',year:'numeric'})}\n${'─'.repeat(50)}\n`;
     daySessions.forEach((s,si)=>{
       const evs=s.events||[];
@@ -858,7 +1009,8 @@ async function exportText() {
       let lastOut=null;
       evs.forEach(ev=>{
         const t=new Date(ev.time),ts=t.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'});
-        const lbls={'punch-in':'▶ PUNCH IN','punch-out':'■ PUNCH OUT','break-out':'⏸ BREAK OUT','break-in':'▶ BREAK IN','geo-out':'↗ LEFT ZONE','geo-in':'↩ BACK IN  '};
+        const lbls={'punch-in':'▶ PUNCH IN','punch-out':'■ PUNCH OUT','break-out':'⏸ BREAK OUT',
+          'break-in':'▶ BREAK IN','geo-out':'↗ LEFT ZONE','geo-in':'↩ BACK IN  '};
         let dur='';
         if((ev.type==='break-in'||ev.type==='geo-in')&&lastOut){dur=' (break: '+fmtDur(t-lastOut)+')';lastOut=null;}
         if(ev.type==='break-out'||ev.type==='geo-out') lastOut=t;
