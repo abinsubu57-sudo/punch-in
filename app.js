@@ -28,10 +28,16 @@ let   posHistory      = [];   // rolling window of recent {lat, lng, accuracy} f
 })();
 
 // ══ SERVICE WORKER MESSAGING ══
-// Sends a message to the active SW so it can show lock-screen notifications.
+// Wait for the SW controller to be ready before posting — it can be null on
+// first load after install, which silently drops all messages.
 function swPost(msg) {
-  if (!navigator.serviceWorker || !navigator.serviceWorker.controller) return;
-  navigator.serviceWorker.controller.postMessage(msg);
+  if (!navigator.serviceWorker) return;
+  const send = (sw) => { try { sw.postMessage(msg); } catch(e) {} };
+  if (navigator.serviceWorker.controller) {
+    send(navigator.serviceWorker.controller);
+  } else {
+    navigator.serviceWorker.ready.then(reg => { if (reg.active) send(reg.active); }).catch(() => {});
+  }
 }
 
 // Request notification permission once — needed for SW notifications to show.
@@ -166,6 +172,8 @@ async function manualBreak() {
 }
 
 function doPause(byGeo) {
+  // Guard: if already paused, don't double-count pausedMs or push duplicate events
+  if (!isRunning) return;
   clearInterval(timerInterval);
   pausedMs += Date.now() - startTS;
   isRunning = false;
@@ -259,7 +267,12 @@ function calcLiveBreakMs() {
       ms += new Date(ev.time) - lastOut; lastOut = null;
     }
   });
-  if ((isPaused || autoGeopaused) && lastOut) ms += Date.now() - lastOut;
+  // CRITICAL: only count the open-ended break if we are ACTUALLY paused right now.
+  // If isRunning=true (timer is active), an orphaned geo-out/break-out with no
+  // matching geo-in must NOT be counted — it means the event was recorded but
+  // the resume event was missed (e.g. after a restore). Counting it would cause
+  // break time to grow forever while the timer appears to be running.
+  if ((isPaused || autoGeopaused) && !isRunning && lastOut) ms += Date.now() - lastOut;
   return ms;
 }
 
@@ -525,7 +538,7 @@ function startWatch() {
 
   watchId = navigator.geolocation.watchPosition(
     pos => { if (workZone) checkFence({ lat: pos.coords.latitude, lng: pos.coords.longitude }, pos.coords.accuracy); },
-    ()   => { pollGeoNow(); },
+    ()   => { /* watch error — silently ignore, fallback interval handles polling */ },
     { enableHighAccuracy:true, maximumAge:2000, timeout:20000 }
   );
 
@@ -538,16 +551,13 @@ function pollGeoNow() {
   navigator.geolocation.getCurrentPosition(
     pos => checkFence({ lat: pos.coords.latitude, lng: pos.coords.longitude }, pos.coords.accuracy),
     () => {
-      if (isRunning && insideZone !== false) {
-        insideZone = false;
-        updateGeoPill(false, Infinity, workZone.radius, null);
-        doPause(true);
-        saveTimer();
-        showToast('🚨 GPS lost — paused');
-        vibrate([200, 100, 200]);
-      }
+      // GPS timeout / unavailable — do NOT pause the timer.
+      // A momentary signal loss is not the same as leaving the zone.
+      // Just update the pill to show GPS is weak so the user can see it.
+      // The exit confirmation counter in checkFence handles real departures.
+      updateGeoPill(insideZone === true, null, workZone ? workZone.radius : 0, null);
     },
-    { enableHighAccuracy:true, timeout:10000, maximumAge:2000 }
+    { enableHighAccuracy:true, timeout:10000, maximumAge:5000 }
   );
 }
 
