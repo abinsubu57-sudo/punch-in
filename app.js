@@ -13,8 +13,12 @@ let toastTmr            = null;
 let geoFallbackInterval = null;
 
 const TARGET_MS       = 8 * 3600000; // 8 hours
-const ACC_CAP         = 15;   // max bonus metres added to zone radius for GPS drift
+const ACC_CAP         = 15;   // max bonus metres from GPS accuracy (kept tight for 15m office)
 const ACCURACY_REJECT = 80;   // ignore fixes worse than this (cell-tower/WiFi noise)
+const EXIT_CONFIRM    = 4;    // consecutive outside averaged readings before pausing
+const POS_HISTORY     = 5;    // number of recent positions to average (smooths GPS drift)
+let   exitCount       = 0;    // resets to 0 the moment any averaged reading is inside
+let   posHistory      = [];   // rolling window of recent {lat, lng, accuracy} fixes
 
 // ══ BOOT ══
 (async () => {
@@ -194,6 +198,7 @@ async function stopTimer() {
 
   isRunning = false; isPaused = false; autoGeopaused = false;
   pausedMs = 0; startTS = null; sessionStart = null; curEvents = [];
+  exitCount = 0; posHistory = [];
   await DB.del('timer', currentUser.username).catch(()=>{});
 
   document.getElementById('timerDisplay').textContent = '00:00:00';
@@ -486,6 +491,7 @@ async function setWorkZone() {
       const r = Math.max(5, parseInt(document.getElementById('radiusInput').value) || 100);
       workZone = { username: currentUser.username, lat: pos.coords.latitude, lng: pos.coords.longitude, radius: r };
       await DB.put('zones', workZone);
+      posHistory = []; exitCount = 0; // clear stale position history for new zone
       btn.disabled = false; btn.textContent = '📌 Update Zone';
       updateZoneDisplay(pos.coords.accuracy);
       showToast('✅ Work zone set (' + r + 'm)');
@@ -550,45 +556,93 @@ function stopWatch() {
   if (geoFallbackInterval) { clearInterval(geoFallbackInterval); geoFallbackInterval = null; }
 }
 
-// ══ FENCE CHECK — with accuracy filtering ══
+// ══ FENCE CHECK — position averaging + accuracy filtering + exit confirmation ══
+//
+// GPS on a phone never gives the same coordinate twice — readings drift
+// naturally 10–30m even when you're standing still. For a tight 15m office
+// zone this causes constant false exits.
+//
+// Solution: keep a rolling window of the last POS_HISTORY (5) good fixes and
+// average them. One bad reading (e.g. 22m away) gets diluted by 4 good ones
+// (e.g. 5m, 6m, 7m, 4m) → averaged position is ~9m, inside the zone.
+// Only a genuine sustained move outside shifts the average past the boundary.
+//
 function checkFence(pos, accuracy) {
   if (!workZone) return;
 
-  // Reject very poor fixes (cell-tower/WiFi coarse location)
+  // Step 1 — reject coarse cell-tower / WiFi fixes entirely
   if (accuracy && accuracy > ACCURACY_REJECT) {
     updateGeoPill(insideZone === true, null, workZone.radius, accuracy);
     return;
   }
 
-  const dist  = haversine(pos.lat, pos.lng, workZone.lat, workZone.lng);
+  // Step 2 — add this fix to the rolling position history
+  posHistory.push({ lat: pos.lat, lng: pos.lng, accuracy: accuracy || 20 });
+  if (posHistory.length > POS_HISTORY) posHistory.shift(); // keep last 5 only
+
+  // Step 3 — compute weighted average position
+  // Weight each fix inversely by its accuracy value so precise fixes count more.
+  // e.g. a ±4m fix gets weight 1/4 = 0.25, a ±20m fix gets weight 1/20 = 0.05
+  let wLat = 0, wLng = 0, wTotal = 0;
+  posHistory.forEach(p => {
+    const w = 1 / Math.max(p.accuracy, 1);
+    wLat   += p.lat * w;
+    wLng   += p.lng * w;
+    wTotal += w;
+  });
+  const avgLat = wLat / wTotal;
+  const avgLng = wLng / wTotal;
+
+  // Step 4 — measure distance from averaged position to zone centre
+  const dist  = haversine(avgLat, avgLng, workZone.lat, workZone.lng);
   const bonus = accuracy ? Math.min(Math.ceil(accuracy), ACC_CAP) : 0;
   const effR  = workZone.radius + bonus;
   const nowIn = dist <= effR;
 
+  // Show the pill using the averaged distance so it's stable
   updateGeoPill(nowIn, dist, effR, accuracy);
-  if (nowIn === insideZone) return;
 
-  const prev = insideZone; insideZone = nowIn;
+  if (nowIn) {
+    // Any averaged-inside reading immediately resets the exit counter
+    exitCount = 0;
 
-  if (!nowIn && isRunning) {
-    doPause(true);
-    saveTimer();
-    showToast('🚨 Left zone — paused');
-    vibrate([300, 150, 300]);
-    swPost({ type: 'GEO_EXIT' }); // triggers lock-screen notification immediately
+    if (insideZone === false || insideZone === null) {
+      const prev = insideZone;
+      insideZone = true;
+
+      if (autoGeopaused) {
+        curEvents.push({ type:'geo-in', time:new Date().toISOString(), note:'Returned to zone' });
+        startTS = Date.now(); isRunning = true; autoGeopaused = false;
+        timerInterval = setInterval(tick, 500);
+        setUI('running'); saveTimer(); updatePunchDetails();
+        document.getElementById('geoAlert').classList.remove('visible');
+        showToast('✅ Back in zone — resumed');
+        vibrate([100]);
+        swPost({ type: 'GEO_ENTER' });
+      }
+      if (prev === null && !isRunning && !isPaused && !autoGeopaused)
+        showToast('📍 Inside work zone — ready to clock in');
+    }
+
+  } else {
+    // Averaged position is outside — need EXIT_CONFIRM (4) consecutive
+    // outside-averaged readings before actually pausing the timer.
+    // With 5-position averaging + 4 confirmations, you'd need roughly
+    // 8–10 real GPS readings showing outside before anything triggers —
+    // that's ~30–40 seconds of genuine absence, not a drift spike.
+    exitCount++;
+
+    if (exitCount >= EXIT_CONFIRM && insideZone !== false) {
+      insideZone = false;
+      if (isRunning) {
+        doPause(true);
+        saveTimer();
+        showToast('🚨 Left zone — paused');
+        vibrate([300, 150, 300]);
+        swPost({ type: 'GEO_EXIT' });
+      }
+    }
   }
-  if (nowIn && autoGeopaused) {
-    curEvents.push({ type:'geo-in', time:new Date().toISOString(), note:'Returned to zone' });
-    startTS = Date.now(); isRunning = true; autoGeopaused = false;
-    timerInterval = setInterval(tick, 500);
-    setUI('running'); saveTimer(); updatePunchDetails();
-    document.getElementById('geoAlert').classList.remove('visible');
-    showToast('✅ Back in zone — resumed');
-    vibrate([100]);
-    swPost({ type: 'GEO_ENTER' });
-  }
-  if (nowIn && prev === null && !isRunning && !isPaused && !autoGeopaused)
-    showToast('📍 Inside work zone — ready to clock in');
 }
 
 // ══ GEO PILL — shows distance + live GPS accuracy ══
