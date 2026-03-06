@@ -10,6 +10,8 @@ let timerInterval = null;
 let weekOffset    = 0;
 let wakeLock      = null;
 let toastTmr      = null;
+// FIX 3: Background geo polling when watchPosition fails (device sleep)
+let geoFallbackInterval = null;
 const TARGET_MS   = 8 * 3600000; // 8 hours
 const ACC_CAP     = 50;
 
@@ -195,15 +197,20 @@ function tick() {
   if (Math.floor(elapsed/30000) !== Math.floor((elapsed-500)/30000)) saveTimer();
 }
 
-// ══ 8H PUNCH-OUT CALCULATOR ══
+// ══ FIX 3: Clock-out = punch-in + 8h + total accumulated break time ══
 function updatePunchDetails() {
   if (!sessionStart) return;
-  const breakMs  = calcLiveBreakMs();
-  const workDone = pausedMs + (isRunning ? Date.now() - startTS : 0) - breakMs;
-  const remaining = Math.max(0, TARGET_MS - workDone);
 
-  // Expected clock-out = now + remaining work time + (breaks still accumulating? no — just add remaining pure work)
-  // Clock-out = punch-in + TARGET_MS + totalBreakTime
+  // Total elapsed wall-clock time since punch-in
+  const elapsedMs  = pausedMs + (isRunning ? Date.now() - startTS : 0);
+  // Break time accumulated so far (includes any ongoing break)
+  const breakMs    = calcLiveBreakMs();
+  // Pure work done = elapsed minus break time
+  const workDone   = elapsedMs - breakMs;
+  const remaining  = Math.max(0, TARGET_MS - workDone);
+
+  // FIX 3: Expected clock-out = punch-in time + 8h target + ALL break time taken so far
+  // As more breaks are taken, expectedOut shifts later by the same amount
   const expectedOut = new Date(sessionStart.getTime() + TARGET_MS + breakMs);
   document.getElementById('expectedOut').textContent =
     expectedOut.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
@@ -236,6 +243,7 @@ function calcLiveBreakMs() {
       ms += new Date(ev.time) - lastOut; lastOut = null;
     }
   });
+  // If currently on break (manual or geo), count ongoing break time too
   if ((isPaused || autoGeopaused) && lastOut) ms += Date.now() - lastOut;
   return ms;
 }
@@ -300,14 +308,30 @@ async function restoreTimer() {
   curEvents    = s.curEvents    || [];
 
   if (s.isRunning && s.startTS) {
-    pausedMs += Date.now() - s.startTS;
+    // FIX 2: When restoring after device sleep, account for the time gap.
+    // The gap since savedAt is added as a geo-out/geo-in event pair so break
+    // time is correctly tracked and the user is warned if they were offline.
+    const gapMs = Date.now() - s.savedAt;
+    if (gapMs > 15000) {
+      // Device was likely sleeping — treat gap as auto-paused geo break
+      curEvents.push({ type:'geo-out', time: new Date(s.savedAt).toISOString(), note:'Device sleep / offline' });
+      curEvents.push({ type:'geo-in',  time: new Date().toISOString(),           note:'App resumed' });
+      pausedMs += gapMs;
+    } else {
+      pausedMs += gapMs;
+    }
     startTS = Date.now(); isRunning = true;
     timerInterval = setInterval(tick, 500);
     setUI('running');
     document.getElementById('punchDetails').style.display = 'block';
     if (sessionStart) document.getElementById('punchInTime').textContent =
       sessionStart.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
-    tick(); showToast('🔄 Timer restored');
+    tick();
+    if (gapMs > 15000) {
+      showToast('⚠ Device was asleep — break recorded for gap');
+    } else {
+      showToast('🔄 Timer restored');
+    }
   } else if (s.isPaused) {
     isPaused = true;
     document.getElementById('timerDisplay').textContent = msToHMS(pausedMs);
@@ -343,13 +367,14 @@ function requestGeoSilent() {
   }).catch(() => startWatch());
 }
 
+// FIX 1: Changed minimum radius from 20m to 5m
 async function setWorkZone() {
   if (!navigator.geolocation) { showToast('❌ Not supported'); return; }
   const btn = document.getElementById('btnSetZone');
   btn.disabled = true; btn.textContent = '📡 Getting GPS…';
   navigator.geolocation.getCurrentPosition(
     async pos => {
-      const r = Math.max(20, parseInt(document.getElementById('radiusInput').value) || 100);
+      const r = Math.max(5, parseInt(document.getElementById('radiusInput').value) || 100); // FIX 1: was Math.max(20, ...)
       workZone = { username: currentUser.username, lat: pos.coords.latitude, lng: pos.coords.longitude, radius: r };
       await DB.put('zones', workZone);
       btn.disabled = false; btn.textContent = '📌 Update Zone';
@@ -377,18 +402,49 @@ function updateZoneDisplay(accuracy) {
   document.getElementById('radiusInput').value = workZone.radius;
 }
 
+// FIX 2: startWatch now also launches a fallback polling interval every 30s
+// so the fence is checked even when watchPosition stops firing (device sleep/background)
 function startWatch() {
   if (watchId !== null) navigator.geolocation.clearWatch(watchId);
   if (!navigator.geolocation) return;
+
   watchId = navigator.geolocation.watchPosition(
     pos => { if (workZone) checkFence({ lat: pos.coords.latitude, lng: pos.coords.longitude }, pos.coords.accuracy); },
-    () => {},
+    err  => {
+      // FIX 2: On watch error (e.g. GPS lost) trigger an immediate poll so state updates
+      pollGeoNow();
+    },
     { enableHighAccuracy:true, maximumAge:5000, timeout:20000 }
+  );
+
+  // FIX 2: Fallback poll every 30s — fires getCurrentPosition independently so
+  // alerts still fire even if watchPosition is frozen (common on Android/iOS when screen is off)
+  if (geoFallbackInterval) clearInterval(geoFallbackInterval);
+  geoFallbackInterval = setInterval(pollGeoNow, 30000);
+}
+
+function pollGeoNow() {
+  if (!workZone || !navigator.geolocation) return;
+  navigator.geolocation.getCurrentPosition(
+    pos => checkFence({ lat: pos.coords.latitude, lng: pos.coords.longitude }, pos.coords.accuracy),
+    ()  => {
+      // GPS unavailable — if timer is running, treat as geo-out (lost signal = left zone)
+      if (isRunning && insideZone !== false) {
+        insideZone = false;
+        updateGeoPill(false, Infinity, workZone ? workZone.radius : 0);
+        doPause(true);
+        saveTimer();
+        showToast('🚨 GPS lost — paused');
+        vibrate([200, 100, 200]);
+      }
+    },
+    { enableHighAccuracy:true, timeout:10000, maximumAge:10000 }
   );
 }
 
 function stopWatch() {
   if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+  if (geoFallbackInterval) { clearInterval(geoFallbackInterval); geoFallbackInterval = null; }
 }
 
 function checkFence(pos, accuracy) {
@@ -415,11 +471,29 @@ function checkFence(pos, accuracy) {
 
 function updateGeoPill(inside, dist, effR) {
   const pill = document.getElementById('geoPill');
-  const dStr = dist < 1000 ? Math.round(dist) + 'm' : (dist/1000).toFixed(2) + 'km';
+  const dStr = dist === Infinity ? 'GPS lost' : dist < 1000 ? Math.round(dist) + 'm' : (dist/1000).toFixed(2) + 'km';
   pill.className = 'geo-pill ' + (inside ? 'inside' : 'outside');
   document.getElementById('geoPillDot').style.background = inside ? 'var(--green)' : 'var(--red)';
   document.getElementById('geoPillText').textContent = inside ? '✓ In zone · ' + dStr : '✗ ' + dStr + ' away';
 }
+
+// FIX 2: When app becomes visible again, immediately re-check fence and restore wake lock
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible') {
+    // Re-check fence position immediately on app resume
+    if (workZone) pollGeoNow();
+    if (isRunning) tick();
+    // FIX 2: Show alert banner again if still in outside state after resume
+    if (autoGeopaused) {
+      document.getElementById('geoAlert').classList.add('visible');
+      showToast('🚨 Still outside work zone');
+    }
+    try {
+      if (wakeLock && isRunning) wakeLock = await navigator.wakeLock.request('screen');
+    } catch(e) {}
+  }
+  await saveTimer();
+});
 
 // ══ STATS ══
 async function refreshStats() {
@@ -838,14 +912,8 @@ function confirmModal(title,body,onOk){
 }
 function closeModal(){ document.getElementById('modalBg').classList.remove('visible'); }
 
-// ══ LIFECYCLE ══
-document.addEventListener('visibilitychange', async()=>{
-  if(document.visibilityState==='visible'&&isRunning) tick();
-  await saveTimer();
-  try{if(wakeLock&&document.visibilityState==='visible'&&isRunning) wakeLock=await navigator.wakeLock.request('screen');}catch(e){}
-});
-window.addEventListener('pagehide',saveTimer);
-window.addEventListener('beforeunload',saveTimer);
+window.addEventListener('pagehide', saveTimer);
+window.addEventListener('beforeunload', saveTimer);
 document.addEventListener('keydown',e=>{
   if(e.key==='Enter'){
     if(document.getElementById('loginForm').style.display!=='none') doLogin();
