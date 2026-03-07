@@ -14,18 +14,44 @@ let geoFallbackInterval = null;
 
 const TARGET_MS       = 8 * 3600000; // 8 hours
 
-// ══ GPS TUNING — Android screen-off causes GPS to fall back to
-//    Wi-Fi/cell location with accuracy 50–300m, causing false exits.
-//    These values are tuned to survive that without false breaks.
-const ACC_CAP         = 25;   // max bonus metres added to zone radius from GPS accuracy
-const ACCURACY_REJECT = 50;   // ignore fixes worse than 50m (was 80 — too lenient)
-const EXIT_CONFIRM    = 8;    // consecutive outside-averaged readings before pausing
-                               // (was 4 — at 30s poll interval this is now ~4 minutes of real absence)
-const POS_HISTORY     = 8;    // rolling average window (was 5 — more averaging = smoother)
-const MIN_BREAK_MS    = 60000; // breaks under 60s are GPS noise — discard them entirely
-                               // (the false 0m 06s, 0m 11s, 0m 39s breaks you saw)
-const SCREEN_OFF_GRACE = 45000; // 45s after screen-on, don't act on geo-exit
-                                // (GPS needs time to re-acquire high-accuracy after screen wakes)
+// ══ GPS TUNING ══
+// Android uses three position sources in order of quality:
+//   1. GPS satellites  — accuracy ±3–15m,   slow to acquire, needs sky view
+//   2. WiFi/Bluetooth  — accuracy ±15–100m,  fast, works indoors
+//   3. Cell towers     — accuracy ±100–2000m, always available
+//
+// Even with enableHighAccuracy=true, Android will use WiFi positioning
+// whenever GPS satellites are unavailable (indoors, screen off, power saver).
+// A WiFi fix with accuracy=80m literally cannot determine if you are inside
+// or outside a 100m zone — the uncertainty circle is nearly as big as the zone.
+//
+// Strategy:
+//   • ACCURACY_REJECT: hard-reject any fix where accuracy > zone radius.
+//     If the fix is less precise than the zone, it's useless for exit detection.
+//   • ACC_CAP: expand effective radius by up to ACC_CAP metres to absorb GPS jitter.
+//     This handles the normal ±15m GPS wobble without triggering false exits.
+//   • EXIT_CONFIRM: require this many consecutive outside readings before pausing.
+//     WiFi fixes flap frequently — this prevents a single bad fix from pausing.
+//   • POS_HISTORY: average this many recent fixes. Dilutes outlier WiFi fixes.
+//   • MIN_BREAK_MS: discard auto-breaks shorter than this — they are GPS noise.
+//   • SCREEN_OFF_GRACE: ignore exits for this long after screen wakes up.
+//     Android needs ~30-45s to drop the stale WiFi fix and acquire real GPS.
+
+const ACC_CAP          = 30;    // expand zone radius by up to 30m to absorb GPS jitter
+const EXIT_CONFIRM     = 10;    // need 10 consecutive outside readings to trigger pause
+                                 // (~5 minutes at 30s poll — eliminates all WiFi flapping)
+const POS_HISTORY      = 10;    // average last 10 fixes — more history = more stable
+const MIN_BREAK_MS     = 120000;// ignore breaks under 2 minutes — WiFi noise is brief
+const SCREEN_OFF_GRACE = 60000; // 60s grace after screen-on before acting on exits
+
+// ACCURACY_REJECT is now dynamic: reject any fix coarser than the zone radius.
+// e.g. for a 100m zone, reject fixes worse than 100m accuracy.
+// This is the key fix for WiFi positioning — a WiFi fix with accuracy=80m
+// tells you nothing about whether you're inside a 100m zone.
+// Minimum floor of 30m so we don't reject all fixes on tiny zones.
+function getAccuracyReject() {
+  return workZone ? Math.max(30, workZone.radius) : 50;
+}
 let   exitCount       = 0;
 let   posHistory      = [];
 let   screenOnTime    = Date.now(); // track when screen last turned on
@@ -699,39 +725,47 @@ function stopWatch() {
   if (geoFallbackInterval) { clearInterval(geoFallbackInterval); geoFallbackInterval = null; }
 }
 
-// ══ FENCE CHECK — position averaging + accuracy filtering + exit confirmation ══
+// ══ FENCE CHECK ══
 //
-// Key improvements over original:
-// 1. EXIT_CONFIRM raised from 4 → 8 (needs ~4 minutes of real absence)
-// 2. POS_HISTORY raised from 5 → 8 (more smoothing of GPS drift)
-// 3. ACCURACY_REJECT tightened from 80 → 50 (cell-tower fixes rejected sooner)
-// 4. SCREEN_OFF_GRACE: 45s after screen-on, geo-exits are suppressed
-//    (GPS needs time to re-acquire high accuracy after screen wakes)
+// Three-tier accuracy system:
+//
+//   TIER 1 — HARD REJECT (accuracy > zone radius)
+//     The fix is so coarse it cannot determine inside/outside.
+//     e.g. WiFi fix ±80m on a 100m zone. Completely ignore it.
+//     Only update the pill to show "weak GPS" so the user knows.
+//
+//   TIER 2 — AMBIGUOUS (accuracy > zone radius / 2)
+//     The fix overlaps the zone boundary — we can't be sure.
+//     e.g. WiFi fix ±60m on a 100m zone: centre is 120m away,
+//     but the uncertainty circle reaches back to 60m inside the zone.
+//     These fixes CAN confirm entry (if dist + accuracy < zone radius)
+//     but CANNOT confirm exit. Don't increment exitCount for these.
+//
+//   TIER 3 — TRUSTED (accuracy <= zone radius / 2)
+//     The fix is precise enough to make a real inside/outside call.
+//     e.g. GPS fix ±12m on a 100m zone. Use normally.
 //
 function checkFence(pos, accuracy) {
   if (!workZone) return;
 
-  // Step 0 — grace period after screen wakes up
-  // Android GPS downgrades to cell/WiFi when screen is off.
-  // When screen turns on, there's a ~30-45s window of coarse readings
-  // before high-accuracy GPS re-acquires. Don't act on exits in this window.
-  const timeSinceScreenOn = Date.now() - screenOnTime;
-  const inGracePeriod = timeSinceScreenOn < SCREEN_OFF_GRACE;
+  const acc            = accuracy || 20;
+  const REJECT_THRESH  = getAccuracyReject();          // tier 1: hard reject
+  const AMBIG_THRESH   = workZone.radius / 2;          // tier 2: ambiguous
+  const timeSinceOn    = Date.now() - screenOnTime;
+  const inGracePeriod  = timeSinceOn < SCREEN_OFF_GRACE;
 
-  // Step 1 — reject coarse cell-tower / WiFi fixes
-  if (accuracy && accuracy > ACCURACY_REJECT) {
-    if (!inGracePeriod) {
-      // Only update pill, never trigger exit during coarse readings
-      updateGeoPill(insideZone === true, null, workZone.radius, accuracy);
-    }
+  // ── TIER 1: hard reject — fix too coarse to be useful ──
+  if (acc > REJECT_THRESH) {
+    // Show pill as "weak GPS" but don't change zone state
+    updateGeoPill(insideZone === true, null, workZone.radius, acc);
     return;
   }
 
-  // Step 2 — add to rolling position history
-  posHistory.push({ lat: pos.lat, lng: pos.lng, accuracy: accuracy || 20 });
+  // ── Add to rolling position history ──
+  posHistory.push({ lat: pos.lat, lng: pos.lng, accuracy: acc });
   if (posHistory.length > POS_HISTORY) posHistory.shift();
 
-  // Step 3 — weighted average (precise fixes weighted more)
+  // ── Weighted average position (precise fixes count more) ──
   let wLat = 0, wLng = 0, wTotal = 0;
   posHistory.forEach(p => {
     const w = 1 / Math.max(p.accuracy, 1);
@@ -742,15 +776,33 @@ function checkFence(pos, accuracy) {
   const avgLat = wLat / wTotal;
   const avgLng = wLng / wTotal;
 
-  // Step 4 — check averaged position vs zone
-  const dist  = haversine(avgLat, avgLng, workZone.lat, workZone.lng);
-  const bonus = accuracy ? Math.min(Math.ceil(accuracy), ACC_CAP) : 0;
-  const effR  = workZone.radius + bonus;
-  const nowIn = dist <= effR;
+  // ── Distance from averaged position to zone centre ──
+  const dist = haversine(avgLat, avgLng, workZone.lat, workZone.lng);
 
-  updateGeoPill(nowIn, dist, effR, accuracy);
+  // ── Effective radius: expand by up to ACC_CAP to absorb normal GPS jitter ──
+  const bonus = Math.min(Math.ceil(acc), ACC_CAP);
+  const effR  = workZone.radius + bonus;
+
+  // ── Is the averaged centre inside the zone? ──
+  const centreInside = dist <= effR;
+
+  // ── TIER 2: ambiguous fix — can confirm entry but NOT exit ──
+  // If accuracy is large relative to the zone, the uncertainty circle
+  // overlaps the boundary. We only trust it if it clearly shows inside.
+  // "Clearly inside" = distance + accuracy < zone radius (no overlap with outside)
+  const clearlyInside  = dist + acc < workZone.radius;
+  const ambiguous      = acc > AMBIG_THRESH;
+
+  // What we actually tell the rest of the function:
+  // - For entry: use clearlyInside OR centreInside (generous — don't block resuming)
+  // - For exit:  only use centreInside when NOT ambiguous (strict — prevent false pauses)
+  const nowIn         = centreInside;          // display + entry decisions
+  const canTriggerExit = !ambiguous && !inGracePeriod; // exit only on trusted fixes
+
+  updateGeoPill(nowIn, dist, effR, acc);
 
   if (nowIn) {
+    // Any inside reading resets exit counter
     exitCount = 0;
 
     if (insideZone === false || insideZone === null) {
@@ -772,8 +824,8 @@ function checkFence(pos, accuracy) {
     }
 
   } else {
-    // During grace period, don't increment exit counter
-    if (inGracePeriod) return;
+    // Only count toward exit if the fix is trusted (not ambiguous, not in grace period)
+    if (!canTriggerExit) return;
 
     exitCount++;
 
@@ -793,18 +845,27 @@ function checkFence(pos, accuracy) {
 // ══ GEO PILL ══
 function updateGeoPill(inside, dist, effR, accuracy) {
   const pill   = document.getElementById('geoPill');
-  const accStr = accuracy ? ' ±' + Math.round(accuracy) + 'm' : '';
+  const acc    = accuracy ? Math.round(accuracy) : null;
+  const accStr = acc ? ' ±' + acc + 'm' : '';
+
+  // Show fix quality so user knows if WiFi is interfering
+  let quality = '';
+  if (acc) {
+    if (!workZone || acc > workZone.radius)      quality = ' · WiFi/cell';
+    else if (acc > workZone.radius / 2)           quality = ' · ~WiFi';
+    else if (acc <= 20)                           quality = ' · GPS✓';
+  }
 
   let text;
   if (dist === null) {
-    text = (inside ? '✓ In zone' : '✗ Out') + ' · weak GPS' + accStr;
+    text = (inside ? '✓ In zone' : '✗ Out') + ' · weak signal' + accStr;
   } else if (dist === Infinity) {
     text = '✗ GPS lost';
   } else {
     const dStr = dist < 1000 ? Math.round(dist) + 'm' : (dist / 1000).toFixed(2) + 'km';
     text = inside
-      ? '✓ In zone · ' + dStr + accStr
-      : '✗ ' + dStr + ' away' + accStr;
+      ? '✓ In zone · ' + dStr + accStr + quality
+      : '✗ ' + dStr + ' away' + accStr + quality;
   }
 
   pill.className = 'geo-pill ' + (inside ? 'inside' : 'outside');
