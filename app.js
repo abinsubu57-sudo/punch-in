@@ -262,25 +262,42 @@ function cleanGpsNoiseBreaks(events) {
 }
 
 function tick() {
-  const elapsed = pausedMs + (isRunning ? Date.now() - startTS : 0);
-  document.getElementById('timerDisplay').textContent = msToHMS(elapsed);
+  // Timer display = work time only (total elapsed minus breaks).
+  // Derive from punch-in event for accuracy — same source as updatePunchDetails.
+  const punchInEvent = curEvents.find(e => e.type === 'punch-in');
+  const punchInTime  = punchInEvent ? new Date(punchInEvent.time) : sessionStart;
+  let workMs = 0;
+  if (punchInTime) {
+    const totalElapsed = Date.now() - punchInTime.getTime();
+    const breakMs      = calcLiveBreakMs();
+    workMs = Math.max(0, totalElapsed - breakMs);
+  }
+  document.getElementById('timerDisplay').textContent = msToHMS(workMs);
   updatePunchDetails();
-  if (Math.floor(elapsed/30000) !== Math.floor((elapsed-500)/30000)) {
+  // Heartbeat every ~30s based on work time
+  if (Math.floor(workMs/30000) !== Math.floor((workMs-500)/30000)) {
     saveTimer();
     swPost({ type: 'HEARTBEAT' });
   }
 }
 
 function updatePunchDetails() {
-  if (!sessionStart) return;
-  // Work time = (now - punch-in) minus all break time.
-  // This is the only correct formula — independent of pausedMs/startTS internals.
-  const totalElapsed = Date.now() - sessionStart.getTime();
+  if (!sessionStart && !curEvents.length) return;
+
+  // Always derive punch-in time from the punch-in event — it is the ground truth.
+  // sessionStart can be slightly wrong after restore due to serialisation/timezone.
+  // The punch-in event timestamp is always exactly right.
+  const punchInEvent = curEvents.find(e => e.type === 'punch-in');
+  const punchInTime  = punchInEvent ? new Date(punchInEvent.time) : sessionStart;
+  if (!punchInTime) return;
+
+  // Work time = (now - punch-in) minus all completed+ongoing break time.
+  const totalElapsed = Date.now() - punchInTime.getTime();
   const breakMs      = calcLiveBreakMs();
   const workDone     = Math.max(0, totalElapsed - breakMs);
   const remaining    = Math.max(0, TARGET_MS - workDone);
 
-  const expectedOut = new Date(sessionStart.getTime() + TARGET_MS + breakMs);
+  const expectedOut = new Date(punchInTime.getTime() + TARGET_MS + breakMs);
   document.getElementById('expectedOut').textContent =
     expectedOut.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
 
@@ -470,6 +487,7 @@ async function restoreTimer() {
 
   } else if (s.isPaused) {
     isPaused = true;
+    pausedMs = s.pausedMs || 0;
     document.getElementById('timerDisplay').textContent = msToHMS(pausedMs);
     document.getElementById('punchDetails').style.display = 'block';
     if (sessionStart) document.getElementById('punchInTime').textContent =
@@ -478,6 +496,7 @@ async function restoreTimer() {
 
   } else if (s.autoGeopaused) {
     autoGeopaused = true;
+    pausedMs = s.pausedMs || 0;
     document.getElementById('timerDisplay').textContent = msToHMS(pausedMs);
     document.getElementById('punchDetails').style.display = 'block';
     if (sessionStart) document.getElementById('punchInTime').textContent =
