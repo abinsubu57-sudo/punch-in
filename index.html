@@ -357,7 +357,7 @@
 <script>
 if('serviceWorker' in navigator){
   window.addEventListener('load',()=>{
-    navigator.serviceWorker.register('sw.js').catch(()=>{});
+    navigator.serviceWorker.register('/punch-in/sw.js', { scope: '/punch-in/' }).catch(()=>{});
   });
 }
 </script>
