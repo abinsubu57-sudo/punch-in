@@ -273,10 +273,12 @@ function tick() {
 
 function updatePunchDetails() {
   if (!sessionStart) return;
-  const elapsedMs = pausedMs + (isRunning ? Date.now() - startTS : 0);
-  const breakMs   = calcLiveBreakMs();
-  const workDone  = elapsedMs - breakMs;
-  const remaining = Math.max(0, TARGET_MS - workDone);
+  // Work time = (now - punch-in) minus all break time.
+  // This is the only correct formula — independent of pausedMs/startTS internals.
+  const totalElapsed = Date.now() - sessionStart.getTime();
+  const breakMs      = calcLiveBreakMs();
+  const workDone     = Math.max(0, totalElapsed - breakMs);
+  const remaining    = Math.max(0, TARGET_MS - workDone);
 
   const expectedOut = new Date(sessionStart.getTime() + TARGET_MS + breakMs);
   document.getElementById('expectedOut').textContent =
@@ -295,23 +297,26 @@ function updatePunchDetails() {
   document.getElementById('progressPct').textContent   = Math.round(workPct) + '%';
 }
 
-// Live break calc: only count breaks >= MIN_BREAK_MS to avoid showing noise
+// Live break calc for the active session display.
+// Completed geo-breaks under MIN_BREAK_MS are noise and excluded.
+// The currently-open break (if paused right now) always counts in full
+// so the live display is accurate while on break.
 function calcLiveBreakMs() {
-  let ms = 0, lastOut = null;
+  let ms = 0, lastOut = null, lastOutIsManual = false;
   curEvents.forEach(ev => {
-    if (ev.type === 'break-out' || ev.type === 'geo-out') lastOut = new Date(ev.time);
-    else if ((ev.type === 'break-in' || ev.type === 'geo-in') && lastOut) {
+    if (ev.type === 'break-out' || ev.type === 'geo-out') {
+      lastOut = new Date(ev.time);
+      lastOutIsManual = ev.type === 'break-out';
+    } else if ((ev.type === 'break-in' || ev.type === 'geo-in') && lastOut) {
       const dur = new Date(ev.time) - lastOut;
-      // Only count if it's a manual break OR long enough to be real
-      const isManual = ev.note && ev.note.toLowerCase().includes('manual');
-      if (isManual || dur >= MIN_BREAK_MS) ms += dur;
-      lastOut = null;
+      // Manual breaks always count; completed geo-breaks only if >= MIN_BREAK_MS
+      if (lastOutIsManual || dur >= MIN_BREAK_MS) ms += dur;
+      lastOut = null; lastOutIsManual = false;
     }
   });
+  // Currently open break — always count it live so display is accurate
   if ((isPaused || autoGeopaused) && !isRunning && lastOut) {
-    const dur = Date.now() - lastOut;
-    const isManual = curEvents.find(e => e.time === lastOut.toISOString() && e.note && e.note.toLowerCase().includes('manual'));
-    if (isManual || dur >= MIN_BREAK_MS) ms += dur;
+    ms += Date.now() - lastOut;
   }
   return ms;
 }
