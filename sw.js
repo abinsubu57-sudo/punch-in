@@ -1,4 +1,4 @@
-const CACHE = 'worktrack-light-v2';
+const CACHE = 'worktrack-light-v3';
 const ASSETS = ['/', '/index.html', '/style.css', '/db.js', '/app.js', '/manifest.json', '/icons/icon-192.png', '/icons/icon-512.png'];
 
 // ══ INSTALL ══
@@ -31,100 +31,102 @@ self.addEventListener('fetch', e => {
 });
 
 // ══ MESSAGES FROM APP ══
-// The app sends messages to the SW to schedule / cancel lock-screen alerts.
-// Message types:
-//   { type: 'TIMER_RUNNING', savedAt, pausedMs, sessionStart }  — start watchdog
-//   { type: 'TIMER_STOPPED' }                                   — cancel watchdog
-//   { type: 'GEO_EXIT' }                                        — immediate alert
-//   { type: 'REQUEST_NOTIFICATION_PERMISSION' }                 — handled in app, not SW
 let watchdogTimer = null;
 
 self.addEventListener('message', e => {
   const msg = e.data;
   if (!msg) return;
 
-  if (msg.type === 'TIMER_RUNNING') {
-    // App is alive and timer is running — reset the watchdog.
-    // If the app stops sending heartbeats (screen locked, killed) the watchdog
-    // fires after 90 seconds and shows a "still tracking" reminder notification.
+  if (msg.type === 'TIMER_RUNNING' || msg.type === 'HEARTBEAT') {
+    // Reset 90-second watchdog
     clearTimeout(watchdogTimer);
     watchdogTimer = setTimeout(() => {
       showNotification(
         '⏱ WorkTrack is still running',
         'Your work timer is active. Unlock to check your status.',
-        'timer-running'
+        'timer-running',
+        false
       );
-    }, 90000); // 90 seconds of silence = screen likely locked
+    }, 90000);
   }
 
   if (msg.type === 'TIMER_STOPPED') {
     clearTimeout(watchdogTimer);
     watchdogTimer = null;
+    // Dismiss any existing timer notification
+    self.registration.getNotifications({ tag: 'timer-running' }).then(notifs => {
+      notifs.forEach(n => n.close());
+    });
   }
 
   if (msg.type === 'GEO_EXIT') {
-    // App detected zone exit and wants an immediate lock-screen notification
     clearTimeout(watchdogTimer);
     showNotification(
       '🚨 Left work zone — timer paused',
-      'You moved outside your work zone. Open WorkTrack to resume.',
-      'geo-exit'
+      'You moved outside your work zone. Return to resume tracking.',
+      'geo-exit',
+      true  // requireInteraction: stays until dismissed
     );
   }
 
   if (msg.type === 'GEO_ENTER') {
+    // Dismiss the geo-exit notification
+    self.registration.getNotifications({ tag: 'geo-exit' }).then(notifs => {
+      notifs.forEach(n => n.close());
+    });
     showNotification(
       '✅ Back in work zone',
       'You returned to your work zone. Timer has resumed.',
-      'geo-enter'
+      'geo-enter',
+      false
     );
-  }
-
-  if (msg.type === 'HEARTBEAT') {
-    // Regular ping from app tick() — resets the watchdog so it only fires
-    // when the app genuinely goes silent (screen lock / background kill)
-    clearTimeout(watchdogTimer);
-    watchdogTimer = setTimeout(() => {
-      showNotification(
-        '⏱ WorkTrack is still running',
-        'Your work timer is active in the background.',
-        'timer-running'
-      );
-    }, 90000);
   }
 });
 
 // ══ NOTIFICATION HELPER ══
-function showNotification(title, body, tag) {
-  self.registration.showNotification(title, {
+// Android notes:
+// - 'silent: false' ensures vibration even when replacing same tag
+// - 'renotify: true' is required to vibrate again on same tag
+// - 'requireInteraction' keeps geo-exit visible until user acts
+// - icon must be png and served from same origin
+function showNotification(title, body, tag, requireInteraction) {
+  const options = {
     body,
-    tag,                        // tag deduplicates — same tag replaces old notification
-    renotify: true,             // vibrate even if replacing same tag
-    icon:    '/icons/icon-192.png',
-    badge:   '/icons/icon-192.png',
-    vibrate: [300, 150, 300, 150, 500],  // strong vibration pattern
-    requireInteraction: tag === 'geo-exit', // geo-exit stays until dismissed
+    tag,
+    renotify:            true,
+    silent:              false,
+    icon:                '/icons/icon-192.png',
+    badge:               '/icons/icon-192.png',
+    vibrate:             [300, 150, 300, 150, 500],
+    requireInteraction:  !!requireInteraction,
+    timestamp:           Date.now(),
     actions: [
       { action: 'open', title: '▶ Open App' }
     ],
     data: { url: '/' }
-  });
+  };
+
+  // showNotification returns a promise — wait for it so the SW doesn't die early
+  return self.registration.showNotification(title, options);
 }
 
 // ══ NOTIFICATION CLICK ══
-// Tapping the notification opens / focuses the app
 self.addEventListener('notificationclick', e => {
   e.notification.close();
   const url = (e.notification.data && e.notification.data.url) || '/';
   e.waitUntil(
     clients.matchAll({ type: 'window', includeUncontrolled: true }).then(list => {
-      // If app is already open in a tab, focus it
       for (const client of list) {
         if (client.url.includes(self.location.origin) && 'focus' in client)
           return client.focus();
       }
-      // Otherwise open a new window
       if (clients.openWindow) return clients.openWindow(url);
     })
   );
+});
+
+// ══ NOTIFICATION CLOSE ══
+// User explicitly dismissed — no action needed
+self.addEventListener('notificationclose', e => {
+  // Optionally log dismissal
 });
