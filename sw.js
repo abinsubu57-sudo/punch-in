@@ -1,31 +1,96 @@
-const CACHE = 'worktrack-light-v3';
-const ASSETS = ['/', '/index.html', '/style.css', '/db.js', '/app.js', '/manifest.json', '/icons/icon-192.png', '/icons/icon-512.png'];
+const CACHE = 'worktrack-v4';
 
-// ══ INSTALL ══
+// Core assets that MUST be cached for offline use.
+// Icons are optional — if they 404 on install it shouldn't break the PWA.
+const CORE_ASSETS = [
+  '/index.html',
+  '/style.css',
+  '/db.js',
+  '/app.js',
+  '/manifest.json'
+];
+
+const OPTIONAL_ASSETS = [
+  '/icons/icon-192.png',
+  '/icons/icon-512.png'
+];
+
+// ══ INSTALL — cache core assets, try optional ones too ══
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+  e.waitUntil(
+    caches.open(CACHE).then(async cache => {
+      // Core assets must succeed
+      await cache.addAll(CORE_ASSETS);
+      // Optional assets: try each individually, ignore failures
+      await Promise.allSettled(
+        OPTIONAL_ASSETS.map(url =>
+          fetch(url).then(res => {
+            if (res.ok) cache.put(url, res);
+          }).catch(() => {})
+        )
+      );
+    }).then(() => self.skipWaiting())
+  );
 });
 
-// ══ ACTIVATE ══
+// ══ ACTIVATE — delete old caches ══
 self.addEventListener('activate', e => {
   e.waitUntil(
     caches.keys()
-      .then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
+      .then(keys => Promise.all(
+        keys.filter(k => k !== CACHE).map(k => caches.delete(k))
+      ))
       .then(() => self.clients.claim())
   );
 });
 
-// ══ FETCH (cache-first with network fallback) ══
+// ══ FETCH — navigation requests always get index.html ══
+// This is the critical fix for the PWA 404:
+// When the app launches from the home screen, the browser navigates to "/"
+// (or whatever start_url is). Without this handler, if "/" isn't cached
+// exactly, the SW returns a 404 instead of serving index.html.
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return;
+
+  const url = new URL(e.request.url);
+
+  // ── Navigation requests (page loads / PWA launch) ──
+  // Always try network first, fall back to cached index.html.
+  // This handles: /, /index.html, and any deep-link paths.
+  if (e.request.mode === 'navigate') {
+    e.respondWith(
+      fetch(e.request)
+        .then(res => {
+          if (res && res.status === 200) {
+            caches.open(CACHE).then(c => c.put(e.request, res.clone()));
+          }
+          return res;
+        })
+        .catch(() => {
+          // Network failed (offline) — serve cached index.html
+          return caches.match('/index.html').then(cached => {
+            return cached || new Response(
+              '<h2>WorkTrack is offline</h2><p>Please check your connection.</p>',
+              { headers: { 'Content-Type': 'text/html' } }
+            );
+          });
+        })
+    );
+    return;
+  }
+
+  // ── Asset requests (JS, CSS, images, fonts) ──
+  // Cache-first: serve from cache instantly, update in background
   e.respondWith(
     caches.match(e.request).then(cached => {
-      const net = fetch(e.request).then(res => {
-        if (res && res.status === 200)
+      const networkFetch = fetch(e.request).then(res => {
+        if (res && res.status === 200 && url.origin === self.location.origin) {
           caches.open(CACHE).then(c => c.put(e.request, res.clone()));
+        }
         return res;
-      }).catch(() => cached);
-      return cached || net;
+      }).catch(() => null);
+
+      return cached || networkFetch;
     })
   );
 });
@@ -38,7 +103,6 @@ self.addEventListener('message', e => {
   if (!msg) return;
 
   if (msg.type === 'TIMER_RUNNING' || msg.type === 'HEARTBEAT') {
-    // Reset 90-second watchdog
     clearTimeout(watchdogTimer);
     watchdogTimer = setTimeout(() => {
       showNotification(
@@ -53,7 +117,6 @@ self.addEventListener('message', e => {
   if (msg.type === 'TIMER_STOPPED') {
     clearTimeout(watchdogTimer);
     watchdogTimer = null;
-    // Dismiss any existing timer notification
     self.registration.getNotifications({ tag: 'timer-running' }).then(notifs => {
       notifs.forEach(n => n.close());
     });
@@ -65,12 +128,11 @@ self.addEventListener('message', e => {
       '🚨 Left work zone — timer paused',
       'You moved outside your work zone. Return to resume tracking.',
       'geo-exit',
-      true  // requireInteraction: stays until dismissed
+      true
     );
   }
 
   if (msg.type === 'GEO_ENTER') {
-    // Dismiss the geo-exit notification
     self.registration.getNotifications({ tag: 'geo-exit' }).then(notifs => {
       notifs.forEach(n => n.close());
     });
@@ -84,30 +146,20 @@ self.addEventListener('message', e => {
 });
 
 // ══ NOTIFICATION HELPER ══
-// Android notes:
-// - 'silent: false' ensures vibration even when replacing same tag
-// - 'renotify: true' is required to vibrate again on same tag
-// - 'requireInteraction' keeps geo-exit visible until user acts
-// - icon must be png and served from same origin
 function showNotification(title, body, tag, requireInteraction) {
-  const options = {
+  return self.registration.showNotification(title, {
     body,
     tag,
-    renotify:            true,
-    silent:              false,
-    icon:                '/icons/icon-192.png',
-    badge:               '/icons/icon-192.png',
-    vibrate:             [300, 150, 300, 150, 500],
-    requireInteraction:  !!requireInteraction,
-    timestamp:           Date.now(),
-    actions: [
-      { action: 'open', title: '▶ Open App' }
-    ],
+    renotify:           true,
+    silent:             false,
+    icon:               '/icons/icon-192.png',
+    badge:              '/icons/icon-192.png',
+    vibrate:            [300, 150, 300, 150, 500],
+    requireInteraction: !!requireInteraction,
+    timestamp:          Date.now(),
+    actions: [{ action: 'open', title: '▶ Open App' }],
     data: { url: '/' }
-  };
-
-  // showNotification returns a promise — wait for it so the SW doesn't die early
-  return self.registration.showNotification(title, options);
+  });
 }
 
 // ══ NOTIFICATION CLICK ══
@@ -123,10 +175,4 @@ self.addEventListener('notificationclick', e => {
       if (clients.openWindow) return clients.openWindow(url);
     })
   );
-});
-
-// ══ NOTIFICATION CLOSE ══
-// User explicitly dismissed — no action needed
-self.addEventListener('notificationclose', e => {
-  // Optionally log dismissal
 });
