@@ -223,6 +223,7 @@ async function stopTimer() {
   isRunning = false; isPaused = false; autoGeopaused = false;
   pausedMs = 0; startTS = null; sessionStart = null; curEvents = [];
   exitCount = 0; posHistory = [];
+  try { localStorage.removeItem('wt_timer_' + currentUser.username); } catch(e) {}
   await DB.del('timer', currentUser.username).catch(()=>{});
 
   document.getElementById('timerDisplay').textContent = '00:00:00';
@@ -352,27 +353,71 @@ function setUI(state) {
 }
 
 // ══ TIMER PERSISTENCE ══
-async function saveTimer() {
-  if (!currentUser) return;
-  if (!isRunning && !isPaused && !autoGeopaused) {
-    await DB.del('timer', currentUser.username).catch(()=>{});
-    return;
-  }
-  await DB.put('timer', {
+// We save to BOTH IndexedDB (reliable, async) and localStorage (synchronous,
+// survives beforeunload where async writes are cut off mid-flight).
+// On restore we check localStorage first (more likely to be current), then
+// fall back to IndexedDB. This fixes the bug where a page reload clears the
+// timer display because the async DB write didn't complete before unload.
+function timerStateObj() {
+  return {
     username: currentUser.username,
     startTS, pausedMs, isRunning, isPaused, autoGeopaused,
     sessionStart: sessionStart ? sessionStart.toISOString() : null,
     curEvents,
     savedAt: Date.now()
-  });
+  };
+}
+
+async function saveTimer() {
+  if (!currentUser) return;
+  if (!isRunning && !isPaused && !autoGeopaused) {
+    // Clear both stores
+    try { localStorage.removeItem('wt_timer_' + currentUser.username); } catch(e) {}
+    await DB.del('timer', currentUser.username).catch(()=>{});
+    return;
+  }
+  const state = timerStateObj();
+  // Synchronous write first — always completes even during beforeunload
+  try { localStorage.setItem('wt_timer_' + currentUser.username, JSON.stringify(state)); } catch(e) {}
+  // Async write to IndexedDB for persistence across browser restarts
+  await DB.put('timer', state).catch(()=>{});
+}
+
+// Called synchronously on beforeunload/pagehide — localStorage only
+function saveTimerSync() {
+  if (!currentUser) return;
+  if (!isRunning && !isPaused && !autoGeopaused) {
+    try { localStorage.removeItem('wt_timer_' + currentUser.username); } catch(e) {}
+    return;
+  }
+  try {
+    localStorage.setItem('wt_timer_' + currentUser.username, JSON.stringify(timerStateObj()));
+  } catch(e) {}
 }
 
 // ══ SMART WAKE-UP RESTORE ══
 // When screen turns back on after being off, we check GPS before deciding
 // whether the gap was sleep (count as work) or genuine absence (count as break).
 async function restoreTimer() {
-  const s = await DB.get('timer', currentUser.username);
+  // Try localStorage first — it's written synchronously on every save/unload
+  // so it's always more current than the async IndexedDB write.
+  let s = null;
+  try {
+    const raw = localStorage.getItem('wt_timer_' + currentUser.username);
+    if (raw) s = JSON.parse(raw);
+  } catch(e) {}
+
+  // Fall back to IndexedDB if localStorage is empty
+  if (!s) {
+    s = await DB.get('timer', currentUser.username);
+  }
+
   if (!s) return;
+
+  // Sync the authoritative state back to both stores so they're consistent
+  // (handles the case where only one store had data)
+  try { localStorage.setItem('wt_timer_' + currentUser.username, JSON.stringify(s)); } catch(e) {}
+  await DB.put('timer', s).catch(()=>{});
 
   pausedMs     = s.pausedMs     || 0;
   sessionStart = s.sessionStart ? new Date(s.sessionStart) : null;
@@ -1029,6 +1074,7 @@ async function clearAllData() {
     await DB.deleteUserSessions(currentUser.username);
     await DB.del('timer', currentUser.username).catch(()=>{});
     await DB.del('zones', currentUser.username).catch(()=>{});
+    try { localStorage.removeItem('wt_timer_' + currentUser.username); } catch(e) {}
     workZone = null;
     isRunning=false; isPaused=false; autoGeopaused=false;
     pausedMs=0; sessionStart=null; curEvents=[];
@@ -1278,8 +1324,10 @@ function confirmModal(title,body,onOk){
 }
 function closeModal(){ document.getElementById('modalBg').classList.remove('visible'); }
 
-window.addEventListener('pagehide', saveTimer);
-window.addEventListener('beforeunload', saveTimer);
+// Use synchronous localStorage write on unload — async DB writes are unreliable
+// during page teardown and frequently get cut off before completing.
+window.addEventListener('pagehide',     saveTimerSync);
+window.addEventListener('beforeunload', saveTimerSync);
 document.addEventListener('keydown',e=>{
   if(e.key==='Enter'){
     if(document.getElementById('loginForm').style.display!=='none') doLogin();
