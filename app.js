@@ -419,14 +419,28 @@ async function restoreTimer() {
   try { localStorage.setItem('wt_timer_' + currentUser.username, JSON.stringify(s)); } catch(e) {}
   await DB.put('timer', s).catch(()=>{});
 
-  pausedMs     = s.pausedMs     || 0;
   sessionStart = s.sessionStart ? new Date(s.sessionStart) : null;
   curEvents    = s.curEvents    || [];
 
   if (s.isRunning && s.startTS) {
-    const gapMs    = Date.now() - s.savedAt;
-    const gapStart = new Date(s.savedAt).toISOString();
-    const gapEnd   = new Date().toISOString();
+    // ── THE CRITICAL FIX ──
+    // s.pausedMs = accumulated ms from all completed segments before last run started
+    // s.startTS  = when the last run segment started (e.g. 08:42 timestamp)
+    // s.savedAt  = when state was last written (last heartbeat / beforeunload)
+    // Now        = current time (after refresh)
+    //
+    // Full elapsed = s.pausedMs + (s.savedAt - s.startTS) + gapMs
+    //
+    // Old buggy code set pausedMs = s.pausedMs then added only gapMs (seconds),
+    // completely losing the (s.savedAt - s.startTS) run segment — everything
+    // from punch-in to the last heartbeat save was dropped on every reload.
+    const runSegmentMs = s.savedAt  - s.startTS;   // ms the timer ran before save
+    const gapMs        = Date.now() - s.savedAt;   // ms since last save (the reload gap)
+    const gapStart     = new Date(s.savedAt).toISOString();
+    const gapEnd       = new Date().toISOString();
+
+    // pausedMs now = all prior work + the completed run segment up to last save
+    pausedMs = (s.pausedMs || 0) + runSegmentMs;
 
     if (gapMs > 8000 && workZone) {
       document.getElementById('timerStatus').textContent = '📡 Checking location after sleep…';
@@ -437,6 +451,7 @@ async function restoreTimer() {
       resolveWakeUpGap(gapMs, gapStart, gapEnd, s);
 
     } else {
+      // Short gap (page refresh, SW claim, etc.) — count as work and resume
       pausedMs += gapMs;
       startTS = Date.now(); isRunning = true;
       timerInterval = setInterval(tick, 500);
