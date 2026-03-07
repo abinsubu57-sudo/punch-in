@@ -13,12 +13,22 @@ let toastTmr            = null;
 let geoFallbackInterval = null;
 
 const TARGET_MS       = 8 * 3600000; // 8 hours
-const ACC_CAP         = 15;   // max bonus metres from GPS accuracy (kept tight for 15m office)
-const ACCURACY_REJECT = 80;   // ignore fixes worse than this (cell-tower/WiFi noise)
-const EXIT_CONFIRM    = 4;    // consecutive outside averaged readings before pausing
-const POS_HISTORY     = 5;    // number of recent positions to average (smooths GPS drift)
-let   exitCount       = 0;    // resets to 0 the moment any averaged reading is inside
-let   posHistory      = [];   // rolling window of recent {lat, lng, accuracy} fixes
+
+// ══ GPS TUNING — Android screen-off causes GPS to fall back to
+//    Wi-Fi/cell location with accuracy 50–300m, causing false exits.
+//    These values are tuned to survive that without false breaks.
+const ACC_CAP         = 25;   // max bonus metres added to zone radius from GPS accuracy
+const ACCURACY_REJECT = 50;   // ignore fixes worse than 50m (was 80 — too lenient)
+const EXIT_CONFIRM    = 8;    // consecutive outside-averaged readings before pausing
+                               // (was 4 — at 30s poll interval this is now ~4 minutes of real absence)
+const POS_HISTORY     = 8;    // rolling average window (was 5 — more averaging = smoother)
+const MIN_BREAK_MS    = 60000; // breaks under 60s are GPS noise — discard them entirely
+                               // (the false 0m 06s, 0m 11s, 0m 39s breaks you saw)
+const SCREEN_OFF_GRACE = 45000; // 45s after screen-on, don't act on geo-exit
+                                // (GPS needs time to re-acquire high-accuracy after screen wakes)
+let   exitCount       = 0;
+let   posHistory      = [];
+let   screenOnTime    = Date.now(); // track when screen last turned on
 
 // ══ BOOT ══
 (async () => {
@@ -28,8 +38,6 @@ let   posHistory      = [];   // rolling window of recent {lat, lng, accuracy} f
 })();
 
 // ══ SERVICE WORKER MESSAGING ══
-// Wait for the SW controller to be ready before posting — it can be null on
-// first load after install, which silently drops all messages.
 function swPost(msg) {
   if (!navigator.serviceWorker) return;
   const send = (sw) => { try { sw.postMessage(msg); } catch(e) {} };
@@ -40,7 +48,6 @@ function swPost(msg) {
   }
 }
 
-// Request notification permission once — needed for SW notifications to show.
 async function requestNotificationPermission() {
   if (!('Notification' in window)) return;
   if (Notification.permission === 'granted') return;
@@ -139,6 +146,7 @@ function showPage(name) {
   document.querySelector(`.nav-tab[data-page="${name}"]`).classList.add('active');
   if (name === 'report') renderReport();
   if (name === 'stats')  renderStats();
+  if (name === 'settings') renderSetupGuide();
 }
 
 // ══ TIMER ══
@@ -172,7 +180,6 @@ async function manualBreak() {
 }
 
 function doPause(byGeo) {
-  // Guard: if already paused, don't double-count pausedMs or push duplicate events
   if (!isRunning) return;
   clearInterval(timerInterval);
   pausedMs += Date.now() - startTS;
@@ -195,12 +202,21 @@ async function stopTimer() {
   const endTime = new Date();
   curEvents.push({ type:'punch-out', time: endTime.toISOString(), note:'' });
 
+  // ── CLEAN UP GPS NOISE BREAKS before saving ──
+  // Remove any geo-out/geo-in pairs where the break duration is under MIN_BREAK_MS.
+  // These are purely GPS drift events, not real departures.
+  const cleanedEvents = cleanGpsNoiseBreaks(curEvents);
+
+  // Recalculate total with cleaned events
+  const cleanedBreakMs = calcBreakMsFromEvents(cleanedEvents);
+  const cleanedWorkMs  = totalMs - cleanedBreakMs;
+
   await DB.addSession({
     username: currentUser.username,
     start:    sessionStart.toISOString(),
     end:      endTime.toISOString(),
     duration: totalMs,
-    events:   [...curEvents],
+    events:   cleanedEvents,
     zone:     workZone ? { lat:workZone.lat, lng:workZone.lng, radius:workZone.radius } : null
   });
 
@@ -215,26 +231,45 @@ async function stopTimer() {
   document.getElementById('punchDetails').style.display = 'none';
   setUI('idle');
 
-  const bms = calcBreakMs({ events: curEvents });
-  const wms = totalMs - bms;
-  showToast('✅ Clocked out — ' + fmtDur(wms) + ' work');
+  showToast('✅ Clocked out — ' + fmtDur(cleanedWorkMs) + ' work');
   swPost({ type: 'TIMER_STOPPED' });
   await refreshStats();
+}
+
+// ── Remove geo break pairs that are pure GPS noise (too short) ──
+function cleanGpsNoiseBreaks(events) {
+  const cleaned = [];
+  let i = 0;
+  while (i < events.length) {
+    const ev = events[i];
+    if (ev.type === 'geo-out') {
+      // Look ahead for matching geo-in
+      const nextGeoIn = events.findIndex((e2, j) => j > i && e2.type === 'geo-in');
+      if (nextGeoIn !== -1) {
+        const breakDur = new Date(events[nextGeoIn].time) - new Date(ev.time);
+        if (breakDur < MIN_BREAK_MS) {
+          // Skip this geo-out AND the matching geo-in — it's noise
+          i = nextGeoIn + 1;
+          continue;
+        }
+      }
+    }
+    cleaned.push(ev);
+    i++;
+  }
+  return cleaned;
 }
 
 function tick() {
   const elapsed = pausedMs + (isRunning ? Date.now() - startTS : 0);
   document.getElementById('timerDisplay').textContent = msToHMS(elapsed);
   updatePunchDetails();
-  // Heartbeat to SW every ~30s — if these stop arriving (screen locked / killed),
-  // the SW watchdog fires a lock-screen notification after 90s of silence.
   if (Math.floor(elapsed/30000) !== Math.floor((elapsed-500)/30000)) {
     saveTimer();
     swPost({ type: 'HEARTBEAT' });
   }
 }
 
-// ══ Clock-out = punch-in + 8h + total break time ══
 function updatePunchDetails() {
   if (!sessionStart) return;
   const elapsedMs = pausedMs + (isRunning ? Date.now() - startTS : 0);
@@ -259,20 +294,24 @@ function updatePunchDetails() {
   document.getElementById('progressPct').textContent   = Math.round(workPct) + '%';
 }
 
+// Live break calc: only count breaks >= MIN_BREAK_MS to avoid showing noise
 function calcLiveBreakMs() {
   let ms = 0, lastOut = null;
   curEvents.forEach(ev => {
     if (ev.type === 'break-out' || ev.type === 'geo-out') lastOut = new Date(ev.time);
     else if ((ev.type === 'break-in' || ev.type === 'geo-in') && lastOut) {
-      ms += new Date(ev.time) - lastOut; lastOut = null;
+      const dur = new Date(ev.time) - lastOut;
+      // Only count if it's a manual break OR long enough to be real
+      const isManual = ev.note && ev.note.toLowerCase().includes('manual');
+      if (isManual || dur >= MIN_BREAK_MS) ms += dur;
+      lastOut = null;
     }
   });
-  // CRITICAL: only count the open-ended break if we are ACTUALLY paused right now.
-  // If isRunning=true (timer is active), an orphaned geo-out/break-out with no
-  // matching geo-in must NOT be counted — it means the event was recorded but
-  // the resume event was missed (e.g. after a restore). Counting it would cause
-  // break time to grow forever while the timer appears to be running.
-  if ((isPaused || autoGeopaused) && !isRunning && lastOut) ms += Date.now() - lastOut;
+  if ((isPaused || autoGeopaused) && !isRunning && lastOut) {
+    const dur = Date.now() - lastOut;
+    const isManual = curEvents.find(e => e.time === lastOut.toISOString() && e.note && e.note.toLowerCase().includes('manual'));
+    if (isManual || dur >= MIN_BREAK_MS) ms += dur;
+  }
   return ms;
 }
 
@@ -329,12 +368,8 @@ async function saveTimer() {
 }
 
 // ══ SMART WAKE-UP RESTORE ══
-// When the device powers back on / app resumes after a gap, we do NOT blindly
-// insert a break for that gap. Instead we immediately request the current GPS
-// position and decide based on actual location:
-//   • Still inside zone  → gap was just device sleep, add as work time (no break)
-//   • Outside zone       → genuine absence, record as geo break + vibrate + alert
-//   • GPS unavailable    → safe fallback: record as break, warn user
+// When screen turns back on after being off, we check GPS before deciding
+// whether the gap was sleep (count as work) or genuine absence (count as break).
 async function restoreTimer() {
   const s = await DB.get('timer', currentUser.username);
   if (!s) return;
@@ -349,17 +384,14 @@ async function restoreTimer() {
     const gapEnd   = new Date().toISOString();
 
     if (gapMs > 8000 && workZone) {
-      // Show a "checking location…" state while we resolve
       document.getElementById('timerStatus').textContent = '📡 Checking location after sleep…';
       document.getElementById('punchDetails').style.display = 'block';
       if (sessionStart) document.getElementById('punchInTime').textContent =
         sessionStart.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
 
-      // Ask for GPS position with a reasonable timeout
       resolveWakeUpGap(gapMs, gapStart, gapEnd, s);
 
     } else {
-      // Short gap (< 8s) — just resume normally, no break needed
       pausedMs += gapMs;
       startTS = Date.now(); isRunning = true;
       timerInterval = setInterval(tick, 500);
@@ -392,18 +424,34 @@ async function restoreTimer() {
 function resolveWakeUpGap(gapMs, gapStart, gapEnd, savedState) {
   const gapMins = Math.round(gapMs / 60000);
 
+  // For short gaps (< 5 min) — almost certainly just screen-off, not real absence.
+  // Don't even wait for GPS, just count as work time and resume.
+  if (gapMs < 5 * 60000) {
+    pausedMs += gapMs;
+    startTS = Date.now(); isRunning = true;
+    timerInterval = setInterval(tick, 500);
+    setUI('running');
+    document.getElementById('punchDetails').style.display = 'block';
+    if (sessionStart) document.getElementById('punchInTime').textContent =
+      sessionStart.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
+    tick();
+    showToast('🔄 Restored — ' + gapMins + 'm screen-off counted as work');
+    saveTimer();
+    updatePunchDetails();
+    return;
+  }
+
   navigator.geolocation.getCurrentPosition(
     pos => {
-      // Got a GPS fix — check if we're still inside the zone
       const accuracy = pos.coords.accuracy;
       const dist     = haversine(pos.coords.latitude, pos.coords.longitude, workZone.lat, workZone.lng);
       const bonus    = accuracy ? Math.min(Math.ceil(accuracy), ACC_CAP) : 0;
       const effR     = workZone.radius + bonus;
-      const nowInside = dist <= effR && accuracy <= ACCURACY_REJECT;
+      // For wake-up check, use a slightly more lenient accuracy threshold
+      // since screen-off GPS is always coarser
+      const nowInside = dist <= effR && accuracy <= 150;
 
       if (nowInside) {
-        // ✅ Phone never left — gap is pure device sleep, count as WORK TIME
-        // Simply add the gap to elapsed work (pausedMs already has pre-gap work)
         pausedMs += gapMs;
         insideZone = true;
         updateGeoPill(true, dist, effR, accuracy);
@@ -414,23 +462,19 @@ function resolveWakeUpGap(gapMs, gapStart, gapEnd, savedState) {
         showToast('🔄 Restored — device slept ' + gapMins + 'm, still in zone ✓');
 
       } else {
-        // 🚨 Phone moved outside or GPS confirms absence — record as break
         curEvents.push({ type:'geo-out', time: gapStart, note: 'Device off / sleep' });
         curEvents.push({ type:'geo-in',  time: gapEnd,   note: 'App resumed' });
         pausedMs += gapMs;
         insideZone = false;
         updateGeoPill(false, dist, effR, accuracy);
 
-        // Resume running but mark as just-returned-from-geo-break
         startTS = Date.now(); isRunning = true; autoGeopaused = false;
         timerInterval = setInterval(tick, 500);
         setUI('running');
         tick();
 
-        // Vibrate hard to alert user that a break was recorded
         vibrate([300, 150, 300, 150, 500]);
         showToast('🚨 Was outside zone for ' + gapMins + 'm — break recorded');
-        // Show the geo alert banner briefly so it's impossible to miss
         const alertEl = document.getElementById('geoAlert');
         alertEl.querySelector('.geo-alert-title').textContent = 'Break recorded for device sleep!';
         alertEl.querySelector('.geo-alert-desc').textContent =
@@ -444,28 +488,37 @@ function resolveWakeUpGap(gapMs, gapStart, gapEnd, savedState) {
     },
 
     () => {
-      // GPS unavailable on resume (no signal, denied, etc.)
-      // Safe fallback: record the gap as a break so no false work time is added
-      curEvents.push({ type:'geo-out', time: gapStart, note: 'Device off — GPS unavailable on resume' });
-      curEvents.push({ type:'geo-in',  time: gapEnd,   note: 'App resumed' });
-      pausedMs += gapMs;
-
-      startTS = Date.now(); isRunning = true;
-      timerInterval = setInterval(tick, 500);
-      setUI('running');
-      document.getElementById('punchDetails').style.display = 'block';
-      if (sessionStart) document.getElementById('punchInTime').textContent =
-        sessionStart.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
-      tick();
-
-      vibrate([200, 100, 200]);
-      showToast('⚠ GPS unavailable — ' + gapMins + 'm gap recorded as break');
+      // GPS unavailable — for short-ish gaps, assume still at work
+      if (gapMs < 30 * 60000) {
+        // Under 30 minutes and no GPS: assume still in zone (most common case for screen-off)
+        pausedMs += gapMs;
+        startTS = Date.now(); isRunning = true;
+        timerInterval = setInterval(tick, 500);
+        setUI('running');
+        document.getElementById('punchDetails').style.display = 'block';
+        if (sessionStart) document.getElementById('punchInTime').textContent =
+          sessionStart.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
+        tick();
+        showToast('⚠ GPS unavailable — ' + gapMins + 'm counted as work (short gap)');
+      } else {
+        // Over 30 minutes and no GPS: safer to record as break
+        curEvents.push({ type:'geo-out', time: gapStart, note: 'Device off — GPS unavailable on resume' });
+        curEvents.push({ type:'geo-in',  time: gapEnd,   note: 'App resumed' });
+        pausedMs += gapMs;
+        startTS = Date.now(); isRunning = true;
+        timerInterval = setInterval(tick, 500);
+        setUI('running');
+        document.getElementById('punchDetails').style.display = 'block';
+        if (sessionStart) document.getElementById('punchInTime').textContent =
+          sessionStart.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
+        tick();
+        vibrate([200, 100, 200]);
+        showToast('⚠ GPS unavailable — ' + gapMins + 'm gap recorded as break (>30m)');
+      }
       saveTimer();
       updatePunchDetails();
     },
 
-    // Use a slightly stale cached position if available (faster response on wake-up)
-    // but not older than 30s — beyond that the phone may have moved significantly
     { enableHighAccuracy: true, timeout: 12000, maximumAge: 30000 }
   );
 }
@@ -504,7 +557,7 @@ async function setWorkZone() {
       const r = Math.max(5, parseInt(document.getElementById('radiusInput').value) || 100);
       workZone = { username: currentUser.username, lat: pos.coords.latitude, lng: pos.coords.longitude, radius: r };
       await DB.put('zones', workZone);
-      posHistory = []; exitCount = 0; // clear stale position history for new zone
+      posHistory = []; exitCount = 0;
       btn.disabled = false; btn.textContent = '📌 Update Zone';
       updateZoneDisplay(pos.coords.accuracy);
       showToast('✅ Work zone set (' + r + 'm)');
@@ -527,7 +580,7 @@ function updateZoneDisplay(accuracy) {
   el.className = 'zone-result' + (warn ? ' warn' : '');
   el.innerHTML =
     `✓ <strong>${workZone.lat.toFixed(5)}, ${workZone.lng.toFixed(5)}</strong> · Radius: ${workZone.radius}m` +
-    (acc ? `<br>${warn ? '⚠ GPS ±' + acc + 'm — consider increasing radius' : '✓ GPS accuracy ±' + acc + 'm'}` : '');
+    (acc ? `<br>${warn ? '⚠ GPS ±' + acc + 'm — consider increasing radius to at least ' + (acc*2) + 'm' : '✓ GPS accuracy ±' + acc + 'm'}` : '');
   document.getElementById('radiusInput').value = workZone.radius;
 }
 
@@ -538,7 +591,7 @@ function startWatch() {
 
   watchId = navigator.geolocation.watchPosition(
     pos => { if (workZone) checkFence({ lat: pos.coords.latitude, lng: pos.coords.longitude }, pos.coords.accuracy); },
-    ()   => { /* watch error — silently ignore, fallback interval handles polling */ },
+    ()   => { /* watch error — fallback interval handles polling */ },
     { enableHighAccuracy:true, maximumAge:2000, timeout:20000 }
   );
 
@@ -551,10 +604,6 @@ function pollGeoNow() {
   navigator.geolocation.getCurrentPosition(
     pos => checkFence({ lat: pos.coords.latitude, lng: pos.coords.longitude }, pos.coords.accuracy),
     () => {
-      // GPS timeout / unavailable — do NOT pause the timer.
-      // A momentary signal loss is not the same as leaving the zone.
-      // Just update the pill to show GPS is weak so the user can see it.
-      // The exit confirmation counter in checkFence handles real departures.
       updateGeoPill(insideZone === true, null, workZone ? workZone.radius : 0, null);
     },
     { enableHighAccuracy:true, timeout:10000, maximumAge:5000 }
@@ -568,31 +617,37 @@ function stopWatch() {
 
 // ══ FENCE CHECK — position averaging + accuracy filtering + exit confirmation ══
 //
-// GPS on a phone never gives the same coordinate twice — readings drift
-// naturally 10–30m even when you're standing still. For a tight 15m office
-// zone this causes constant false exits.
-//
-// Solution: keep a rolling window of the last POS_HISTORY (5) good fixes and
-// average them. One bad reading (e.g. 22m away) gets diluted by 4 good ones
-// (e.g. 5m, 6m, 7m, 4m) → averaged position is ~9m, inside the zone.
-// Only a genuine sustained move outside shifts the average past the boundary.
+// Key improvements over original:
+// 1. EXIT_CONFIRM raised from 4 → 8 (needs ~4 minutes of real absence)
+// 2. POS_HISTORY raised from 5 → 8 (more smoothing of GPS drift)
+// 3. ACCURACY_REJECT tightened from 80 → 50 (cell-tower fixes rejected sooner)
+// 4. SCREEN_OFF_GRACE: 45s after screen-on, geo-exits are suppressed
+//    (GPS needs time to re-acquire high accuracy after screen wakes)
 //
 function checkFence(pos, accuracy) {
   if (!workZone) return;
 
-  // Step 1 — reject coarse cell-tower / WiFi fixes entirely
+  // Step 0 — grace period after screen wakes up
+  // Android GPS downgrades to cell/WiFi when screen is off.
+  // When screen turns on, there's a ~30-45s window of coarse readings
+  // before high-accuracy GPS re-acquires. Don't act on exits in this window.
+  const timeSinceScreenOn = Date.now() - screenOnTime;
+  const inGracePeriod = timeSinceScreenOn < SCREEN_OFF_GRACE;
+
+  // Step 1 — reject coarse cell-tower / WiFi fixes
   if (accuracy && accuracy > ACCURACY_REJECT) {
-    updateGeoPill(insideZone === true, null, workZone.radius, accuracy);
+    if (!inGracePeriod) {
+      // Only update pill, never trigger exit during coarse readings
+      updateGeoPill(insideZone === true, null, workZone.radius, accuracy);
+    }
     return;
   }
 
-  // Step 2 — add this fix to the rolling position history
+  // Step 2 — add to rolling position history
   posHistory.push({ lat: pos.lat, lng: pos.lng, accuracy: accuracy || 20 });
-  if (posHistory.length > POS_HISTORY) posHistory.shift(); // keep last 5 only
+  if (posHistory.length > POS_HISTORY) posHistory.shift();
 
-  // Step 3 — compute weighted average position
-  // Weight each fix inversely by its accuracy value so precise fixes count more.
-  // e.g. a ±4m fix gets weight 1/4 = 0.25, a ±20m fix gets weight 1/20 = 0.05
+  // Step 3 — weighted average (precise fixes weighted more)
   let wLat = 0, wLng = 0, wTotal = 0;
   posHistory.forEach(p => {
     const w = 1 / Math.max(p.accuracy, 1);
@@ -603,17 +658,15 @@ function checkFence(pos, accuracy) {
   const avgLat = wLat / wTotal;
   const avgLng = wLng / wTotal;
 
-  // Step 4 — measure distance from averaged position to zone centre
+  // Step 4 — check averaged position vs zone
   const dist  = haversine(avgLat, avgLng, workZone.lat, workZone.lng);
   const bonus = accuracy ? Math.min(Math.ceil(accuracy), ACC_CAP) : 0;
   const effR  = workZone.radius + bonus;
   const nowIn = dist <= effR;
 
-  // Show the pill using the averaged distance so it's stable
   updateGeoPill(nowIn, dist, effR, accuracy);
 
   if (nowIn) {
-    // Any averaged-inside reading immediately resets the exit counter
     exitCount = 0;
 
     if (insideZone === false || insideZone === null) {
@@ -635,11 +688,9 @@ function checkFence(pos, accuracy) {
     }
 
   } else {
-    // Averaged position is outside — need EXIT_CONFIRM (4) consecutive
-    // outside-averaged readings before actually pausing the timer.
-    // With 5-position averaging + 4 confirmations, you'd need roughly
-    // 8–10 real GPS readings showing outside before anything triggers —
-    // that's ~30–40 seconds of genuine absence, not a drift spike.
+    // During grace period, don't increment exit counter
+    if (inGracePeriod) return;
+
     exitCount++;
 
     if (exitCount >= EXIT_CONFIRM && insideZone !== false) {
@@ -655,7 +706,7 @@ function checkFence(pos, accuracy) {
   }
 }
 
-// ══ GEO PILL — shows distance + live GPS accuracy ══
+// ══ GEO PILL ══
 function updateGeoPill(inside, dist, effR, accuracy) {
   const pill   = document.getElementById('geoPill');
   const accStr = accuracy ? ' ±' + Math.round(accuracy) + 'm' : '';
@@ -678,14 +729,18 @@ function updateGeoPill(inside, dist, effR, accuracy) {
 }
 
 // ══ VISIBILITY CHANGE ══
-// When the app comes back to foreground (screen unlock, tab switch, etc.)
-// immediately poll GPS and re-evaluate zone state — never assume.
 document.addEventListener('visibilitychange', async () => {
   if (document.visibilityState === 'visible') {
+    // Record when screen came back on — used for GPS grace period
+    screenOnTime = Date.now();
+    // Clear stale position history — it's from before screen-off, don't use it
+    posHistory = [];
+    exitCount  = 0;
+
     if (workZone) pollGeoNow();
     if (isRunning) {
       tick();
-      swPost({ type: 'HEARTBEAT' }); // app is visible again, reset watchdog
+      swPost({ type: 'HEARTBEAT' });
     }
     if (autoGeopaused) {
       document.getElementById('geoAlert').classList.add('visible');
@@ -695,12 +750,66 @@ document.addEventListener('visibilitychange', async () => {
       if (wakeLock && isRunning) wakeLock = await navigator.wakeLock.request('screen');
     } catch(e) {}
   } else {
-    // Screen locked / app backgrounded — send one last heartbeat so SW
-    // starts the 90s countdown to show "timer still running" notification
     if (isRunning) swPost({ type: 'HEARTBEAT' });
   }
   await saveTimer();
 });
+
+// ══ SETUP GUIDE ══
+// Renders Android-specific instructions for making notifications work
+function renderSetupGuide() {
+  const el = document.getElementById('setupGuide');
+  if (!el) return;
+  const isAndroid = /android/i.test(navigator.userAgent);
+  const isIOS     = /iphone|ipad/i.test(navigator.userAgent);
+  const isPWA     = window.matchMedia('(display-mode: standalone)').matches;
+  const notifOk   = 'Notification' in window && Notification.permission === 'granted';
+
+  let html = '<div class="setup-section">';
+  html += '<div class="setup-title">📱 For best accuracy & notifications</div>';
+
+  if (!isPWA) {
+    html += `<div class="setup-step warn">
+      <strong>⚠ Install as app</strong>
+      <p>${isIOS
+        ? 'Tap Share → "Add to Home Screen". PWA mode is required for lock-screen notifications.'
+        : 'Tap ⋮ menu → "Add to Home Screen" or "Install app". Required for background tracking.'
+      }</p>
+    </div>`;
+  } else {
+    html += `<div class="setup-step good"><strong>✅ Running as installed app</strong></div>`;
+  }
+
+  if (!notifOk) {
+    html += `<div class="setup-step warn">
+      <strong>⚠ Notifications not granted</strong>
+      <p>Tap the button below to enable lock-screen alerts when you leave the zone.</p>
+      <button class="settings-btn accent" onclick="requestNotificationPermission()">Enable Notifications</button>
+    </div>`;
+  } else {
+    html += `<div class="setup-step good"><strong>✅ Notifications enabled</strong></div>`;
+  }
+
+  if (isAndroid) {
+    html += `<div class="setup-step">
+      <strong>🔋 Disable battery optimisation</strong>
+      <p>Android kills background apps aggressively. To prevent GPS being cut off:<br>
+      Settings → Apps → <em>your browser / WorkTrack</em> → Battery → <strong>Unrestricted</strong></p>
+    </div>
+    <div class="setup-step">
+      <strong>📍 Allow location "All the time"</strong>
+      <p>Settings → Apps → <em>your browser</em> → Permissions → Location → <strong>Allow all the time</strong><br>
+      This lets GPS work while screen is off.</p>
+    </div>
+    <div class="setup-step">
+      <strong>📶 Why do I see false breaks?</strong>
+      <p>When your screen turns off, Android switches GPS from high-accuracy to Wi-Fi/cell location (±50–200m). WorkTrack now requires <strong>8 consecutive outside readings</strong> and ignores breaks under 60 seconds to filter this out. Increase your zone radius to <strong>150m+</strong> if you still see false breaks.</p>
+    </div>`;
+  }
+
+  html += '</div>';
+  el.innerHTML = html;
+}
 
 // ══ STATS ══
 async function refreshStats() {
@@ -896,11 +1005,20 @@ function buildBreakChips(events) {
 }
 
 function calcBreakMs(s) {
-  if (!s.events) return 0;
-  let ms = 0, lastOut = null;
-  s.events.forEach(ev => {
-    if (ev.type==='break-out'||ev.type==='geo-out') lastOut = new Date(ev.time);
-    else if ((ev.type==='break-in'||ev.type==='geo-in') && lastOut) { ms += new Date(ev.time)-lastOut; lastOut=null; }
+  return calcBreakMsFromEvents(s.events);
+}
+
+function calcBreakMsFromEvents(events) {
+  if (!events) return 0;
+  let ms = 0, lastOut = null, lastOutType = null;
+  events.forEach(ev => {
+    if (ev.type==='break-out'||ev.type==='geo-out') { lastOut = new Date(ev.time); lastOutType = ev.type; }
+    else if ((ev.type==='break-in'||ev.type==='geo-in') && lastOut) {
+      const dur = new Date(ev.time) - lastOut;
+      // Manual breaks always count; auto geo-breaks only count if >= MIN_BREAK_MS
+      if (lastOutType === 'break-out' || dur >= MIN_BREAK_MS) ms += dur;
+      lastOut = null; lastOutType = null;
+    }
   });
   return ms;
 }
