@@ -14,6 +14,41 @@
 <title>WorkTrack</title>
 <link href="https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,400;0,600;1,400;1,600&family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css">
+<style>
+/* ── Setup Guide ── */
+.setup-section { margin-top: 8px; }
+.setup-title {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink2);
+  margin-bottom: 10px;
+}
+.setup-step {
+  background: var(--surf2);
+  border: 1px solid var(--brd);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  font-size: 0.78rem;
+  color: var(--ink2);
+  line-height: 1.5;
+}
+.setup-step strong { color: var(--ink); display: block; margin-bottom: 4px; }
+.setup-step p { margin: 4px 0 0; }
+.setup-step em { font-style: normal; font-weight: 600; color: var(--ink); }
+.setup-step.warn {
+  border-color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 8%, var(--surf));
+}
+.setup-step.good {
+  border-color: var(--green);
+  background: color-mix(in srgb, var(--green) 8%, var(--surf));
+  color: var(--green);
+}
+.setup-step.good strong { color: var(--green); }
+</style>
 </head>
 <body>
 
@@ -275,12 +310,19 @@
         <div class="zone-row">
           <div class="zone-field">
             <label class="field-lbl">Radius (meters)</label>
-            <!-- FIX 1: min changed from 20 to 5 -->
             <input type="number" class="field-input compact" id="radiusInput" value="100" min="5" max="5000">
           </div>
           <button class="settings-btn accent" id="btnSetZone" onclick="setWorkZone()">📌 Set Zone</button>
         </div>
         <div class="zone-result" id="zoneResult"></div>
+      </div>
+
+      <!-- SETUP GUIDE — rendered by renderSetupGuide() -->
+      <div class="settings-card">
+        <div id="setupGuide">
+          <div class="setup-title">📱 Android Setup Guide</div>
+          <div style="font-size:0.78rem;color:var(--ink3)">Loading…</div>
+        </div>
       </div>
 
       <div class="settings-card danger">
